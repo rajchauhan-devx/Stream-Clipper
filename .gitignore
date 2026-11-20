@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+*.pt
+
+# Node & Frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+.pnpm-debug.log*
+
+# Media Workspace (Keep folders, ignore video/audio assets)
+workspace/downloads/*
+!workspace/downloads/.gitkeep
+workspace/proxies/*
+!workspace/proxies/.gitkeep
+workspace/renders/*
+!workspace/renders/.gitkeep
+workspace/assets/*
+!workspace/assets/.gitkeep
+workspace/temp/*
+!workspace/temp/.gitkeep
+
+# Secrets & Environment
+.env
+client_secret.json
+token.json
+
+# OS Specific
+.DS_Store
+Thumbs.db

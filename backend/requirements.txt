@@ -1,0 +1,24 @@
+# Core API & ASGI Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.0
+pydantic>=2.9.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+
+# AI Brain & Multimodal Director
+google-genai>=1.0.0
+
+# Video & Audio Processing
+yt-dlp>=2024.10.0
+opencv-python-headless>=4.10.0
+torch>=2.4.0
+torchvision>=0.19.0
+ultralytics>=8.3.0
+faster-whisper>=1.0.3
+av<14
+demucs>=4.0.0
+
+# Platform Publishers
+google-api-python-client>=2.149.0
+google-auth-oauthlib>=1.2.1
