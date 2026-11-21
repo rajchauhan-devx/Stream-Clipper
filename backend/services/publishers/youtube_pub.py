@@ -53,10 +53,12 @@ class YouTubePublisher:
         title: str,
         description: str,
         tags: Optional[list] = None,
-        privacy: str = "private"
+        privacy: str = "public",
+        publish_at: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Uploads 1080x1920 MP4 video to YouTube Shorts with resumable upload.
+        Supports public, unlisted, private, or scheduled publishing.
         """
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -69,7 +71,23 @@ class YouTubePublisher:
         if "Shorts" not in tags:
             tags.append("Shorts")
 
-        logger.info(f"Uploading {video_path.name} to YouTube Shorts [{privacy}]...")
+        status_dict: Dict[str, Any] = {
+            "selfDeclaredMadeForKids": False
+        }
+        
+        # YouTube requires scheduled videos to have privacyStatus="private" and publishAt in RFC 3339
+        if privacy == "scheduled" and publish_at:
+            status_dict["privacyStatus"] = "private"
+            # Ensure ISO 8601 formatting ends with Z
+            formatted_dt = publish_at
+            if not formatted_dt.endswith("Z") and "+" not in formatted_dt:
+                formatted_dt = f"{formatted_dt}Z"
+            status_dict["publishAt"] = formatted_dt
+            logger.info(f"Scheduling {video_path.name} to publish at {formatted_dt}...")
+        else:
+            status_dict["privacyStatus"] = privacy if privacy in ["public", "private", "unlisted"] else "public"
+            logger.info(f"Uploading {video_path.name} to YouTube Shorts [{status_dict['privacyStatus']}]...")
+
         youtube = self._get_authenticated_service()
 
         body = {
@@ -79,10 +97,7 @@ class YouTubePublisher:
                 "tags": tags,
                 "categoryId": "20"  # Gaming Category
             },
-            "status": {
-                "privacyStatus": privacy,
-                "selfDeclaredMadeForKids": False
-            }
+            "status": status_dict
         }
 
         media = MediaFileUpload(

@@ -8,6 +8,28 @@ from backend.config import RENDERS_DIR, ASSETS_DIR, HARDWARE
 
 logger = logging.getLogger("gta6-studio.renderer")
 
+def _get_font(font_names, size: int):
+    from PIL import ImageFont
+    if isinstance(font_names, str):
+        font_names = [font_names]
+    for name in font_names:
+        candidates = [
+            name,
+            f"C:/Windows/Fonts/{name}",
+            f"/System/Library/Fonts/Supplemental/{name}",
+            f"/System/Library/Fonts/{name}",
+            f"/usr/share/fonts/truetype/{name}",
+        ]
+        for c in candidates:
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
 class VideoRenderer:
     def __init__(self):
         self.renders_dir = RENDERS_DIR
@@ -19,18 +41,14 @@ class VideoRenderer:
         if badge_path.exists():
             return badge_path
         try:
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw
             w, h = 240, 52
             badge = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             draw = ImageDraw.Draw(badge)
             draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=12, fill=(18, 16, 28, 240), outline=(238, 77, 160, 200), width=2)
             draw.line([14, 10, 14, h - 10], fill=(238, 77, 160, 255), width=3)
-            try:
-                font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Impact.ttf", 26)
-                font_sub = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 13)
-            except Exception:
-                font = ImageFont.load_default()
-                font_sub = ImageFont.load_default()
+            font = _get_font(["impact.ttf", "Impact.ttf", "Arial Bold.ttf", "arialbd.ttf"], 26)
+            font_sub = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 13)
             draw.text((26, 11), "GTA VI", fill=(255, 255, 255), font=font)
             draw.text((115, 17), "• 4K 60FPS", fill=(0, 255, 230), font=font_sub)
             badge.save(str(badge_path))
@@ -50,7 +68,7 @@ class VideoRenderer:
         """
         banner_path = self.assets_dir / f"{job_id}_{clip_id}_topic_banner.png"
         try:
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw
             w, h = 880, 140
             banner = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             draw = ImageDraw.Draw(banner)
@@ -60,10 +78,7 @@ class VideoRenderer:
 
             # Category pill tag
             tag_text = f"🔥 {category_tag.upper()}" if not category_tag.startswith("🔥") else category_tag.upper()
-            try:
-                font_tag = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 13)
-            except Exception:
-                font_tag = ImageFont.load_default()
+            font_tag = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 13)
 
             tag_bbox = draw.textbbox((0, 0), tag_text, font=font_tag)
             tag_w = (tag_bbox[2] - tag_bbox[0]) + 24
@@ -82,10 +97,7 @@ class VideoRenderer:
             elif len(headline) > 28:
                 font_size = 38
 
-            try:
-                font_main = ImageFont.truetype("/System/Library/Fonts/Supplemental/Impact.ttf", font_size)
-            except Exception:
-                font_main = ImageFont.load_default()
+            font_main = _get_font(["impact.ttf", "Impact.ttf", "arialbd.ttf"], font_size)
 
             draw.text((32, 54 + (44 - font_size) // 2), headline, fill=(255, 255, 255), font=font_main)
             banner.save(str(banner_path))
@@ -138,12 +150,8 @@ class VideoRenderer:
             v_stream = "v_head"
             logger.info("Overlaid top topic headline banner at (W-w)/2:260")
 
-        # 1. Overlay callout PNG (displayed in top safe-area during 0s - 3.5s)
-        if overlay_png_path and overlay_png_path.exists():
-            inputs.extend(["-i", str(overlay_png_path)])
-            overlay_idx = len(inputs) // 2 - 1
-            filter_chain.append(f"[{v_stream}][{overlay_idx}:v]overlay=(W-w)/2:120:enable='between(t,0,3.5)'[v_overlay]")
-            v_stream = "v_overlay"
+        # 1. Callout PNG overlay sticker has been removed per user requirement
+        # (prevents temporary blue box popup during 0s-3.5s at the start of clips)
 
         # 1.5. Dynamic AI Watermark / Creator Tag Masker Badge
         if watermark_corner and str(watermark_corner).lower() not in ("none", "null", ""):
@@ -190,11 +198,17 @@ class VideoRenderer:
         cmd.extend([
             "-c:v", codec,
             *encoder_args,
+            "-fps_mode", "cfr",
             "-r", "60",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
             "-c:a", "aac",
             "-b:a", "192k",
             "-ar", "48000",
             "-pix_fmt", "yuv420p",
+            "-brand", "mp42",
+            "-use_editlist", "0",
             "-movflags", "+faststart",
             str(final_mp4_path)
         ])
@@ -205,16 +219,30 @@ class VideoRenderer:
             # Fallback CPU command
             cpu_cmd = ["ffmpeg", "-y", *inputs]
             if filter_chain:
-                cpu_cmd.extend(["-filter_complex", full_filter, "-map", f"[{v_stream}]", "-map", "1:a"])
+                cpu_cmd.extend(["-filter_complex", full_filter, "-map", f"[{v_stream}]", "-map", "[a_master]"])
             else:
                 cpu_cmd.extend(["-map", "0:v", "-map", "1:a"])
             cpu_cmd.extend([
                 "-c:v", "libx264",
                 "-preset", "fast",
                 "-crf", "20",
+                "-profile:v", "high",
+                "-level", "4.2",
+                "-g", "60",
+                "-bf", "2",
+                "-flags", "+cgop",
+                "-fps_mode", "cfr",
                 "-r", "60",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
                 "-c:a", "aac",
                 "-b:a", "192k",
+                "-ar", "48000",
+                "-pix_fmt", "yuv420p",
+                "-brand", "mp42",
+                "-use_editlist", "0",
+                "-movflags", "+faststart",
                 str(final_mp4_path)
             ])
             subprocess.run(cpu_cmd, check=True)

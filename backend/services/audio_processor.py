@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import shutil
 import logging
 import subprocess
@@ -35,7 +36,7 @@ class AudioProcessor:
         try:
             # Run demucs command-line tool with two-stems=vocals or htdemucs
             cmd = [
-                sys_python := ".venv/bin/python", "-m", "demucs",
+                sys.executable, "-m", "demucs",
                 "--two-stems", "vocals",
                 "-n", "htdemucs",
                 "--out", str(demucs_out_dir),

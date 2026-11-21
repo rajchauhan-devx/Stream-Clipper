@@ -50,8 +50,9 @@ def get_node_package_manager():
         return str(nvm_pnpm)
 
     for cmd in ["pnpm", "npm", "yarn"]:
-        if shutil.which(cmd):
-            return cmd
+        resolved = shutil.which(cmd)
+        if resolved:
+            return resolved
     return "npm"
 
 def wait_for_port(url, max_retries=30, delay=0.5):
@@ -87,7 +88,7 @@ def main():
         for proc in processes:
             try:
                 if sys.platform == "win32":
-                    proc.terminate()
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
                 else:
                     proc.send_signal(signal.SIGINT)
             except Exception:

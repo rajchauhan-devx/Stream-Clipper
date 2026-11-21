@@ -35,24 +35,29 @@ class MetaPublisher:
         self,
         video_path: Path,
         caption: str,
-        hashtags: Optional[list] = None
+        hashtags: Optional[list] = None,
+        video_state: str = "PUBLISHED",
+        scheduled_publish_time: Optional[int] = None,
+        custom_page_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Publishes 9:16 vertical video to Facebook Reels using the 3-step Ruploadd Graph API.
+        Supports instant publishing, scheduling, or saving as draft.
         """
         token = self._ensure_credentials("Facebook Reels")
-        page_id = self.page_id or os.getenv("META_PAGE_ID")
+        page_id = custom_page_id or self.page_id or os.getenv("META_PAGE_ID")
         if not page_id:
-            raise ValueError("META_PAGE_ID not set. Please configure in Settings.")
+            raise ValueError("META_PAGE_ID not set. Please configure in Settings or enter Page ID.")
 
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
         full_description = caption
         if hashtags:
-            full_description += "\n\n" + " ".join(hashtags)
+            clean_tags = ["#" + t.lstrip("#") for t in hashtags]
+            full_description += "\n\n" + " ".join(clean_tags)
 
-        logger.info(f"Initiating Facebook Reels upload for {video_path.name} to page {page_id}...")
+        logger.info(f"Initiating Facebook Reels upload ({video_state}) for {video_path.name} to page {page_id}...")
 
         # Step 1: Start Upload Phase
         init_url = f"{GRAPH_BASE}/{page_id}/video_reels"
@@ -79,25 +84,36 @@ class MetaPublisher:
             if upload_res.status_code not in [200, 201]:
                 raise RuntimeError(f"FB Reels Binary Upload Failed: {upload_res.text}")
 
-        # Step 3: Finish Upload & Publish
-        finish_res = requests.post(init_url, data={
+        # Step 3: Finish Upload & Publish / Schedule / Draft
+        finish_payload: Dict[str, Any] = {
             "upload_phase": "finish",
             "access_token": token,
             "video_id": video_id,
-            "video_state": "PUBLISHED",
             "description": full_description
-        })
+        }
+
+        if video_state == "SCHEDULED" and scheduled_publish_time:
+            finish_payload["video_state"] = "SCHEDULED"
+            finish_payload["scheduled_publish_time"] = int(scheduled_publish_time)
+            logger.info(f"Scheduling Facebook Reel for epoch {scheduled_publish_time}...")
+        elif video_state == "DRAFT":
+            finish_payload["video_state"] = "DRAFT"
+        else:
+            finish_payload["video_state"] = "PUBLISHED"
+
+        finish_res = requests.post(init_url, data=finish_payload)
         if finish_res.status_code != 200:
             raise RuntimeError(f"FB Reels Finish Failed: {finish_res.text}")
 
         reel_url = f"https://www.facebook.com/reel/{video_id}"
-        logger.info(f"Facebook Reel published successfully: {reel_url}")
+        logger.info(f"Facebook Reel processed successfully: {reel_url} [{video_state}]")
 
         return {
             "platform": "facebook",
             "video_id": video_id,
             "url": reel_url,
-            "status": "published"
+            "status": video_state.lower(),
+            "caption": caption
         }
 
     # --------------------------------------------------------------------------

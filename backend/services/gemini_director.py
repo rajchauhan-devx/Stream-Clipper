@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import time
 import json
@@ -33,9 +34,17 @@ class GeminiDirectorService:
 
     def _init_client(self):
         # 1. Primary: Check Google Cloud ADC (matching new-oms-native pattern)
-        adc_path = Path(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", Path.home() / ".config" / "gcloud" / "application_default_credentials.json"))
+        custom_cred = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if custom_cred:
+            adc_path = Path(custom_cred)
+        elif sys.platform == "win32":
+            adc_path = Path(os.environ.get("APPDATA", "")) / "gcloud" / "application_default_credentials.json"
+        else:
+            adc_path = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+
         if adc_path.exists():
             try:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc_path)
                 with open(adc_path) as f:
                     data = json.load(f)
                 project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or data.get("quota_project_id") or ""
@@ -165,7 +174,16 @@ CRITICAL VISUAL GROUNDING RULES (DO NOT HALLUCINATE):
 REQUIREMENTS:
 - Target Language: {target_language.upper()} (e.g. Hinglish: natural, energetic gaming slang, Hindi, or English).
 - Voiceover Pacing: {voiceover_pacing.upper()}.
-  * If 'HOOK_ONLY': Write an energetic, high-retention 3 to 5-second opening HOOK (12-20 words max) that hooks the viewer on the exact action seen in the clip (e.g. 'Wait till you see where Jason takes Lucia next...', 'This GTA 6 driving physics is completely unreal!'). After this opening hook, the voice stops so in-game dialogue and sound effects take over.
+  * If 'HOOK_ONLY': You MUST write an ULTRA-SHORT, PUNCHY opening hook line of ONLY 4 TO 7 WORDS MAXIMUM (finishes in under 2 to 2.5 seconds).
+    Do NOT make the starting line long. It MUST finish very fast so the viewer immediately gets immersed in the raw in-game gameplay audio.
+    Examples of ideal short hooks:
+    - "Caught in the act!" (4 words)
+    - "Watch what happens next!" (4 words)
+    - "Wait till you see this!" (5 words)
+    - "Lucia pulled off the impossible!" (5 words)
+    - "Bro did not expect this!" (5 words)
+    - "They never saw this coming!" (5 words)
+    STRICT REQUIREMENT: NEVER exceed 7 words! Keep it ultra-short and punchy so it finishes in 2 seconds.
   * If 'FULL_COMMENTARY': Write continuous lively commentary reacting to the action throughout the clip duration.
 - Target Clip Length: {clip_length_range} per clip.
 - Virality Score (1-100): Rate retention and hook potential.
@@ -264,7 +282,7 @@ REQUIREMENTS:
                     try:
                         resp = client.models.generate_content(
                             model=tm,
-                            contents=f"Say energetically in an entertaining gamer tone: {script}",
+                            contents=f"Say energetically and fast in an entertaining gamer tone in under 2 seconds: {script}",
                             config=cfg
                         )
                         for part in resp.candidates[0].content.parts:
@@ -335,19 +353,27 @@ REQUIREMENTS:
     # --------------------------------------------------------------------------
     def _generate_fallback_plan(self, title: str, count: int, language: str) -> DirectorPlan:
         """Generates realistic structured director plan for testing"""
+        short_hooks = [
+            "Caught in the act!",
+            "She actually pulled this off!",
+            "Bro did not expect that!",
+            "Watch this insane police chase!",
+            "They never saw this coming!"
+        ]
         clips = []
         for i in range(1, count + 1):
             start = (i - 1) * 35.0
             end = start + 32.0
+            clip_script = short_hooks[(i - 1) % len(short_hooks)]
             clip = ClipBlueprint(
                 clip_id=f"clip_{i}",
                 start_time=start,
                 end_time=end,
                 duration=32.0,
                 virality_score=88 + i,
-                hook_text=f"GTA 6 INSANE MOMENT #{i} 🚨",
+                hook_text=f"GTA 6 MOMENT #{i} 🚨",
                 hook_summary=f"High-speed action and crazy stunt sequence #{i}",
-                commentary_script=f"Bhai dekho yahan kya hua! In clip {i}, the police chase escalated instantly and this stunt was unbelievable!",
+                commentary_script=clip_script,
                 has_copyrighted_music=False,
                 detected_music_name=None,
                 overlay_prompt=f"Gaming 'BUSTED' or 'WASTED' bold graphic badge for clip {i}",
@@ -388,15 +414,15 @@ REQUIREMENTS:
         if not clean_text:
             clean_text = "Wait till you see what happens next in Vice City!"
 
-        # 1. Primary on macOS: use native `say` command
+        # 1. Primary on macOS: use native `say` command with fast brisk rate (210 wpm)
         try:
             aiff_temp = output_path.with_suffix(".aiff")
-            # Try high-retention English voice 'Daniel' or system default
-            cmd = ["say", "-v", "Daniel", "-r", "185", "-o", str(aiff_temp), clean_text]
+            # Try high-retention English voice 'Daniel' or system default with energetic 210 wpm pace
+            cmd = ["say", "-v", "Daniel", "-r", "210", "-o", str(aiff_temp), clean_text]
             res = subprocess.run(cmd, capture_output=True)
             if res.returncode != 0:
                 # Fallback to system default voice if 'Daniel' is missing
-                cmd = ["say", "-r", "185", "-o", str(aiff_temp), clean_text]
+                cmd = ["say", "-r", "210", "-o", str(aiff_temp), clean_text]
                 subprocess.run(cmd, check=True, capture_output=True)
 
             # Convert to standard 48kHz mono 16-bit PCM WAV
@@ -415,11 +441,12 @@ REQUIREMENTS:
         except Exception as ex:
             logger.warning(f"macOS say TTS failed ({ex}). Attempting cross-platform speech...")
 
-        # 2. Windows fallback using PowerShell SpeechSynthesizer
+        # 2. Windows fallback using PowerShell SpeechSynthesizer with brisk rate (+2)
         try:
             ps_script = f"""
             Add-Type -AssemblyName System.Speech;
             $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;
+            $synth.Rate = 2;
             $synth.SetOutputToWaveFile('{output_path}');
             $synth.Speak('{clean_text}');
             $synth.Dispose();

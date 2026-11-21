@@ -3,6 +3,7 @@ import logging
 import asyncio
 from typing import Dict, Any, List, Optional, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -10,14 +11,16 @@ from pathlib import Path
 import os
 import shutil
 from backend.config import (
-    HARDWARE, WORKSPACE_DIR, BASE_DIR, TEMP_DIR, DOWNLOADS_DIR, PROXIES_DIR,
+    HARDWARE, WORKSPACE_DIR, BASE_DIR, TEMP_DIR, DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR,
     GEMINI_API_KEY, META_ACCESS_TOKEN, META_PAGE_ID, INSTAGRAM_ACCOUNT_ID,
     DIRECTOR_MODEL, TTS_MODEL, IMAGE_MODEL
 )
 from backend.schemas import (
     CreateJobRequest, UpdateClipRequest, SettingsUpdateRequest,
     HardwareStatusResponse, JobProgressUpdate, JobStatus, OperatingMode,
-    CropMode, CaptionStyle, LongVideoStrategy, ResetPipelineRequest, ResetPipelineResponse
+    CropMode, CaptionStyle, LongVideoStrategy, ResetPipelineRequest, ResetPipelineResponse,
+    YouTubePublishRequest, YouTubeAuthStatusResponse,
+    FacebookPublishRequest, FacebookStatusResponse
 )
 from backend.services.ingest import ingest_service
 from backend.services.gemini_director import gemini_director
@@ -54,6 +57,25 @@ app.mount("/workspace", StaticFiles(directory=str(WORKSPACE_DIR)), name="workspa
 # In-memory Job & WebSocket Connection State
 JOBS_DB: Dict[str, Dict[str, Any]] = {}
 ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
+JOBS_CACHE_FILE = WORKSPACE_DIR / "jobs_db.json"
+
+def save_jobs_db():
+    try:
+        JOBS_CACHE_FILE.write_text(json.dumps(JOBS_DB, indent=2, default=str), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not persist JOBS_DB: {e}")
+
+def load_jobs_db():
+    global JOBS_DB
+    if JOBS_CACHE_FILE.exists():
+        try:
+            loaded = json.loads(JOBS_CACHE_FILE.read_text(encoding="utf-8"))
+            JOBS_DB.update(loaded)
+            logger.info(f"Loaded {len(loaded)} job(s) from {JOBS_CACHE_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not load JOBS_DB from cache: {e}")
+
+load_jobs_db()
 
 def clean_workspace_files(job_id: str = None, delete_all: bool = True) -> int:
     """Safely removes video downloads, proxies, demucs audio, and temp files, returning bytes freed."""
@@ -131,9 +153,35 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     job = JOBS_DB[job_id]
     clip = job["clips"][clip_idx]
     clip_id = clip["clip_id"]
-    source_path = Path(job["metadata"].get("cut_path") or job["metadata"]["raw_path"])
     req = job["request"]
     clip_num = clip_idx + 1
+
+    raw_path_str = job["metadata"].get("raw_path")
+    cut_path_str = job["metadata"].get("cut_path")
+    cut_start_sec = float(job["metadata"].get("cut_start_sec", 0.0))
+    cut_dur_sec = float(job["metadata"].get("cut_duration_sec", 0.0))
+
+    raw_path = Path(raw_path_str) if raw_path_str else None
+    cut_path = Path(cut_path_str) if cut_path_str else None
+
+    clip_start = float(clip["start_time"])
+    clip_dur = float(clip["duration"])
+
+    # Determine optimal video source and safe seeking timestamp
+    if raw_path and raw_path.exists():
+        source_path = raw_path
+        start_time = cut_start_sec + clip_start
+        raw_dur = float(job["metadata"].get("duration", 0.0))
+        if raw_dur > 0 and (start_time + clip_dur) > raw_dur:
+            start_time = max(0.0, raw_dur - clip_dur - 1.0)
+    elif cut_path and cut_path.exists():
+        source_path = cut_path
+        start_time = clip_start
+        if cut_dur_sec > 0 and (start_time + clip_dur) > cut_dur_sec:
+            start_time = max(0.0, cut_dur_sec - clip_dur - 1.0)
+    else:
+        source_path = Path(raw_path_str or cut_path_str)
+        start_time = clip_start
 
     # 1. 9:16 Vertical Video Crop
     if progress_callback:
@@ -143,8 +191,8 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     await asyncio.to_thread(
         video_cropper.crop_to_vertical,
         raw_video_path=source_path,
-        start_time=clip["start_time"],
-        duration=clip["duration"],
+        start_time=start_time,
+        duration=clip_dur,
         output_cropped_path=cropped_path,
         mode=crop_mode
     )
@@ -154,8 +202,8 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     import subprocess
     subprocess.run([
         "ffmpeg", "-y",
-        "-ss", str(clip["start_time"]),
-        "-t", str(clip["duration"]),
+        "-ss", str(start_time),
+        "-t", str(clip_dur),
         "-i", str(source_path),
         "-vn", "-c:a", "pcm_s16le", "-ar", "48000",
         str(seg_audio)
@@ -194,7 +242,7 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     # 6. Final Hardware Burn-in Render (M4 VideoToolbox / RTX 3050 NVENC)
     if progress_callback:
         progress_callback(f"Clip {clip_num}/{total_clips}: M4 hardware rendering final 1080x1920 60fps MP4...")
-    overlay_path = Path(clip["overlay_path"]) if clip.get("overlay_path") else None
+    overlay_path = None  # Callout rectangle blue box overlay disabled/removed
 
     # Determine dynamic watermark concealment corner via AI supervision
     watermark_corner = None
@@ -239,6 +287,7 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     clip["rendered_video_path"] = str(final_mp4)
     clip["preview_url"] = f"/workspace/renders/{final_mp4.name}"
     clip["status"] = "rendered"
+    save_jobs_db()
 
 # ------------------------------------------------------------------------------
 # Asynchronous Job Execution Pipeline
@@ -258,6 +307,7 @@ async def execute_job_pipeline(job_id: str):
         job["status"] = status_val
         if data:
             job.update(data)
+        save_jobs_db()
         await manager.broadcast(job_id, {
             "event": "progress",
             "job_id": job_id,
@@ -377,48 +427,30 @@ async def execute_job_pipeline(job_id: str):
             )
             clip["voice_path"] = str(voice_path)
 
-            if enable_overlays:
-                overlay_path = await asyncio.to_thread(
-                    gemini_director.generate_callout_overlay,
-                    prompt=clip["overlay_prompt"],
-                    hook_text=clip["hook_text"],
-                    job_id=job_id,
-                    clip_id=clip_id
-                )
-                clip["overlay_path"] = str(overlay_path)
-            else:
-                clip["overlay_path"] = None
+            # Keep overlay_path null to prevent callout rectangle box popups
+            clip["overlay_path"] = None
 
-        # Step 5: Mode Decision
-        if req.mode == OperatingMode.MANUAL_STUDIO:
+        # Step 5: Autonomous AI Render of All Clips with Hardware Acceleration
+        total_clips = len(job["clips"])
+        for idx in range(total_clips):
+            clip_num = idx + 1
+            base_pct = 75 + int((idx / total_clips) * 22)
             await send_progress(
-                100,
-                "Gemini Director analysis complete. Ready for Studio review & fine-tuning.",
-                JobStatus.COMPLETED,
-                {"clips": job["clips"], "plan": job["plan"], "metadata": job.get("metadata", {})}
+                base_pct,
+                f"Autonomous AI rendering Clip {clip_num}/{total_clips} (9:16 {HARDWARE.ffmpeg_codec})...",
+                JobStatus.RENDERING
             )
-        else:
-            # Auto-Pilot Mode: Proceed to Render All Clips with Hardware Acceleration
-            total_clips = len(job["clips"])
-            for idx in range(total_clips):
-                clip_num = idx + 1
-                base_pct = 75 + int((idx / total_clips) * 22)
-                await send_progress(
-                    base_pct,
-                    f"Hardware rendering Clip {clip_num}/{total_clips} (9:16 {HARDWARE.ffmpeg_codec})...",
-                    JobStatus.RENDERING
-                )
-                await render_single_clip(
-                    job_id, idx, total_clips,
-                    progress_callback=lambda m: sync_cb(base_pct, m, JobStatus.RENDERING)
-                )
+            await render_single_clip(
+                job_id, idx, total_clips,
+                progress_callback=lambda m: sync_cb(base_pct, m, JobStatus.RENDERING)
+            )
 
-            await send_progress(
-                100,
-                f"All {total_clips} clips rendered successfully in 1080x1920 60fps!",
-                JobStatus.COMPLETED,
-                {"clips": job["clips"], "plan": job["plan"], "metadata": job.get("metadata", {})}
-            )
+        await send_progress(
+            100,
+            f"All {total_clips} clips rendered successfully in 1080x1920 60fps!",
+            JobStatus.COMPLETED,
+            {"clips": job["clips"], "plan": job["plan"], "metadata": job.get("metadata", {})}
+        )
 
     except asyncio.CancelledError:
         logger.info(f"Pipeline job {job_id} cancelled by user.")
@@ -528,6 +560,7 @@ async def create_job(request: CreateJobRequest):
         "clips": []
     }
     JOBS_DB[job_id] = job_entry
+    save_jobs_db()
     logger.info(f"Created new job: {job_id} [Mode: {request.mode}]")
 
     task = asyncio.create_task(execute_job_pipeline(job_id))
@@ -602,8 +635,22 @@ async def cancel_job(job_id: str):
     """Cancels a specific job and wipes its associated downloads and artifacts."""
     return await reset_pipeline(ResetPipelineRequest(job_id=job_id, delete_all=False))
 
+@app.get("/api/jobs")
+async def list_all_jobs():
+    load_jobs_db()
+    return list(JOBS_DB.values())
+
+@app.get("/api/jobs/latest")
+async def get_latest_job():
+    load_jobs_db()
+    if not JOBS_DB:
+        return None
+    return list(JOBS_DB.values())[-1]
+
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
+    if job_id not in JOBS_DB:
+        load_jobs_db()
     if job_id not in JOBS_DB:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return JOBS_DB[job_id]
@@ -674,8 +721,41 @@ async def render_clip_endpoint(job_id: str, clip_id: str, background_tasks: Back
     background_tasks.add_task(run_render)
     return {"status": "success", "message": f"Rendering clip {clip_id} initiated."}
 
+@app.get("/api/jobs/{job_id}/clips/{clip_id}/download")
+async def download_clip_endpoint(job_id: str, clip_id: str):
+    """Directly downloads rendered MP4 with Content-Disposition attachment header"""
+    final_file = RENDERS_DIR / f"{job_id}_{clip_id}_final.mp4"
+    if not final_file.exists():
+        raise HTTPException(status_code=404, detail="Rendered clip not found on disk")
+    return FileResponse(
+        path=str(final_file),
+        media_type="video/mp4",
+        filename=f"GTA6_{clip_id}_Short.mp4"
+    )
+
+@app.get("/api/youtube/status", response_model=YouTubeAuthStatusResponse)
+async def get_youtube_status():
+    from backend.services.publishers.youtube_pub import TOKEN_FILE
+    from backend.config import YOUTUBE_CLIENT_SECRETS_FILE
+    secrets_path = Path(YOUTUBE_CLIENT_SECRETS_FILE)
+    return {
+        "has_token": TOKEN_FILE.exists(),
+        "has_client_secret": secrets_path.exists(),
+        "client_secrets_path": str(secrets_path),
+        "channel_title": None
+    }
+
+@app.post("/api/youtube/client-secret")
+async def save_client_secret(payload: Dict[str, Any]):
+    from backend.config import YOUTUBE_CLIENT_SECRETS_FILE
+    secrets_path = Path(YOUTUBE_CLIENT_SECRETS_FILE)
+    if "content" in payload:
+        secrets_path.write_text(payload["content"], encoding="utf-8")
+        return {"status": "success", "message": f"Saved client_secret.json to {secrets_path}"}
+    raise HTTPException(status_code=400, detail="Missing 'content' in payload")
+
 @app.post("/api/jobs/{job_id}/clips/{clip_id}/publish/youtube")
-async def publish_youtube(job_id: str, clip_id: str):
+async def publish_youtube(job_id: str, clip_id: str, payload: Optional[YouTubePublishRequest] = None):
     if job_id not in JOBS_DB:
         raise HTTPException(status_code=404, detail="Job not found")
     job = JOBS_DB[job_id]
@@ -684,21 +764,39 @@ async def publish_youtube(job_id: str, clip_id: str):
         raise HTTPException(status_code=400, detail="Clip must be rendered before publishing.")
 
     sm = clip.get("social_metadata", {}).get("youtube", {})
+    title = (payload.title if payload and payload.title else sm.get("title")) or f"GTA 6 Viral Moment #{clip_id}"
+    description = (payload.description if payload and payload.description else sm.get("description")) or "Viral GTA 6 Moment #Shorts"
+    tags = (payload.tags if payload and payload.tags is not None else sm.get("tags")) or ["Shorts", "GTA6"]
+    privacy = (payload.privacy if payload and payload.privacy else sm.get("privacy")) or "public"
+    publish_at = payload.publish_at if payload else None
+
     try:
         res = youtube_publisher.publish_short(
             video_path=Path(clip["rendered_video_path"]),
-            title=sm.get("title", f"GTA 6 Viral Moment #{clip_id}"),
-            description=sm.get("description", "Viral GTA 6 Moment #Shorts"),
-            tags=sm.get("tags", ["Shorts", "GTA6"]),
-            privacy=sm.get("privacy", "private")
+            title=title,
+            description=description,
+            tags=tags,
+            privacy=privacy,
+            publish_at=publish_at
         )
         return res
     except Exception as e:
         logger.error(f"YouTube publishing error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/facebook/status", response_model=FacebookStatusResponse)
+async def get_facebook_status():
+    from backend.config import META_ACCESS_TOKEN, META_PAGE_ID
+    token = META_ACCESS_TOKEN or os.getenv("META_ACCESS_TOKEN", "")
+    page_id = META_PAGE_ID or os.getenv("META_PAGE_ID", "")
+    return {
+        "has_token": bool(token),
+        "has_page_id": bool(page_id),
+        "page_id": page_id or None
+    }
+
 @app.post("/api/jobs/{job_id}/clips/{clip_id}/publish/facebook")
-async def publish_facebook(job_id: str, clip_id: str):
+async def publish_facebook(job_id: str, clip_id: str, payload: Optional[FacebookPublishRequest] = None):
     if job_id not in JOBS_DB:
         raise HTTPException(status_code=404, detail="Job not found")
     job = JOBS_DB[job_id]
@@ -707,11 +805,20 @@ async def publish_facebook(job_id: str, clip_id: str):
         raise HTTPException(status_code=400, detail="Clip must be rendered before publishing.")
 
     sm = clip.get("social_metadata", {}).get("facebook", {})
+    caption = (payload.caption if payload and payload.caption else sm.get("caption")) or "GTA 6 Gameplay Reel!"
+    hashtags = (payload.hashtags if payload and payload.hashtags is not None else sm.get("hashtags")) or ["#GTA6", "#GamingReels"]
+    video_state = (payload.video_state if payload and payload.video_state else "PUBLISHED")
+    scheduled_publish_time = payload.scheduled_publish_time if payload else None
+    page_id = payload.page_id if payload and payload.page_id else None
+
     try:
         res = meta_publisher.publish_facebook_reel(
             video_path=Path(clip["rendered_video_path"]),
-            caption=sm.get("caption", "GTA 6 Gameplay Reel!"),
-            hashtags=sm.get("hashtags", ["#GTA6", "#GamingReels"])
+            caption=caption,
+            hashtags=hashtags,
+            video_state=video_state,
+            scheduled_publish_time=scheduled_publish_time,
+            custom_page_id=page_id
         )
         return res
     except Exception as e:
@@ -767,6 +874,8 @@ async def get_export_pack(job_id: str, clip_id: str):
 async def websocket_progress_endpoint(websocket: WebSocket, job_id: str):
     await manager.connect(job_id, websocket)
     try:
+        if job_id not in JOBS_DB:
+            load_jobs_db()
         if job_id in JOBS_DB:
             await websocket.send_json({
                 "event": "state_snapshot",

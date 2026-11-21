@@ -161,8 +161,8 @@ class VideoCropper:
         ]
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            logger.error(f"FFmpeg crop failed: {result.stderr[:200]}")
+        if result.returncode != 0 or not output_cropped_path.exists() or output_cropped_path.stat().st_size < 1000:
+            logger.warning(f"FFmpeg crop failed or produced empty file: {result.stderr[:200] if result else ''}. Falling back to center crop.")
             # Fallback to simple center crop if complex filter fails
             fallback_cmd = [
                 "ffmpeg", "-y",

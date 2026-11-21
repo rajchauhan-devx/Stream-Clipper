@@ -50,7 +50,7 @@ class HardwareEngine:
         self.accelerator = "CPU"
         self.vram_gb = 0.0
         self.ffmpeg_codec = "libx264"
-        self.encoder_args: List[str] = ["-preset", "fast", "-crf", "22"]
+        self.encoder_args: List[str] = ["-preset", "fast", "-crf", "22", "-profile:v", "high", "-level", "4.2", "-g", "60", "-bf", "2", "-flags", "+cgop"]
         self.whisper_backend = "faster-whisper"
         self.compute_type = "int8"
         self.is_apple_silicon = False
@@ -70,9 +70,9 @@ class HardwareEngine:
                 total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 self.vram_gb = round(total_vram, 2)
 
-                # Configure NVENC hardware encoder
+                # Configure NVENC hardware encoder (YouTube Shorts / Reels high compatibility)
                 self.ffmpeg_codec = "h264_nvenc"
-                self.encoder_args = ["-preset", "p4", "-cq", "20"]
+                self.encoder_args = ["-preset", "p4", "-cq", "20", "-profile:v", "high", "-level", "4.2", "-g", "60", "-bf", "2", "-flags", "+cgop"]
                 self.whisper_backend = "faster-whisper"
                 self.compute_type = "float16" if self.vram_gb >= 4.0 else "int8"
                 return

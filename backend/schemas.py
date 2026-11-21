@@ -91,7 +91,7 @@ class ClipBlueprint(BaseModel):
     virality_score: int = Field(..., ge=1, le=100, description="Virality potential rating from 1 to 100")
     hook_text: str = Field(..., description="Immediate attention-grabbing visual hook text (0-3s)")
     hook_summary: str = Field(..., description="Brief 1-sentence synopsis of why this moment is viral")
-    commentary_script: str = Field(..., description="Energetic, transformative voiceover commentary script")
+    commentary_script: str = Field(..., description="Ultra-short punchy opening hook (4-7 words maximum, finishes under 2.5s)")
     has_copyrighted_music: bool = Field(default=False, description="True if GTA in-game radio music is playing")
     detected_music_name: Optional[str] = Field(default=None, description="Name/artist of detected song if any")
     overlay_prompt: str = Field(..., description="Visual prompt for gemini-3.1-flash-image callout graphic")
@@ -186,3 +186,28 @@ class ResetPipelineResponse(BaseModel):
     status: str
     message: str
     freed_mb: float
+
+class YouTubePublishRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    privacy: str = "public"  # "public", "private", "unlisted", "scheduled"
+    publish_at: Optional[str] = None  # ISO 8601 string e.g. "2026-11-21T18:00:00Z"
+
+class YouTubeAuthStatusResponse(BaseModel):
+    has_token: bool
+    has_client_secret: bool
+    client_secrets_path: str
+    channel_title: Optional[str] = None
+
+class FacebookPublishRequest(BaseModel):
+    caption: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+    video_state: str = "PUBLISHED"  # "PUBLISHED", "SCHEDULED", "DRAFT"
+    scheduled_publish_time: Optional[int] = None  # Epoch timestamp in seconds
+    page_id: Optional[str] = None
+
+class FacebookStatusResponse(BaseModel):
+    has_token: bool
+    has_page_id: bool
+    page_id: Optional[str] = None

@@ -2,12 +2,10 @@ import { useState, useEffect, useRef } from 'react';
 import {
   Zap,
   FolderPlus,
-  Sliders,
   Share2,
   Settings as SettingsIcon,
   Cpu,
   Bot,
-  SlidersHorizontal,
   CheckCircle2,
   Clock,
   Sparkles,
@@ -17,7 +15,6 @@ import {
   PlayCircle,
   TrendingUp,
   Volume2,
-  RotateCw,
   Eye,
   Download,
   Check,
@@ -33,7 +30,13 @@ import {
   ChevronUp,
   Activity,
   Scissors,
-  AlertCircle
+  AlertCircle,
+  Copy,
+  Calendar,
+  Globe,
+  Lock,
+  EyeOff,
+  X
 } from 'lucide-react';
 
 interface HardwareStatus {
@@ -86,9 +89,37 @@ interface Clip {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'new_project' | 'studio' | 'upload' | 'settings'>('new_project');
-  const [operatingMode, setOperatingMode] = useState<'auto_pilot' | 'manual_studio'>('auto_pilot');
+  const [activeTab, setActiveTab] = useState<'new_project' | 'studio' | 'youtube' | 'facebook' | 'upload' | 'settings'>('new_project');
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
+
+  // YouTube Direct Publishing State
+  const [ytTitle, setYtTitle] = useState('');
+  const [ytDescription, setYtDescription] = useState('');
+  const [ytTags, setYtTags] = useState<string[]>([]);
+  const [ytTagInput, setYtTagInput] = useState('');
+  const [ytPrivacy, setYtPrivacy] = useState<'public' | 'unlisted' | 'private' | 'scheduled'>('public');
+  const [ytScheduleDate, setYtScheduleDate] = useState('');
+  const [ytScheduleTime, setYtScheduleTime] = useState('18:00');
+  const [ytPublishing, setYtPublishing] = useState(false);
+  const [ytPublishResult, setYtPublishResult] = useState<{ url: string; video_id: string } | null>(null);
+  const [ytPublishError, setYtPublishError] = useState<string | null>(null);
+  const [ytAuthStatus, setYtAuthStatus] = useState<{ has_token: boolean; has_client_secret: boolean } | null>(null);
+  const [showYtAuthModal, setShowYtAuthModal] = useState(false);
+  const [ytSecretContent, setYtSecretContent] = useState('');
+
+  // Facebook Reels Direct Publishing State
+  const [fbCaption, setFbCaption] = useState('');
+  const [fbHashtags, setFbHashtags] = useState<string[]>([]);
+  const [fbTagInput, setFbTagInput] = useState('');
+  const [fbPageId, setFbPageId] = useState('');
+  const [fbState, setFbState] = useState<'PUBLISHED' | 'SCHEDULED' | 'DRAFT'>('PUBLISHED');
+  const [fbScheduleDate, setFbScheduleDate] = useState('');
+  const [fbScheduleTime, setFbScheduleTime] = useState('18:00');
+  const [fbPublishing, setFbPublishing] = useState(false);
+  const [fbPublishResult, setFbPublishResult] = useState<{ url: string; video_id: string } | null>(null);
+  const [fbPublishError, setFbPublishError] = useState<string | null>(null);
+  const [fbAuthStatus, setFbAuthStatus] = useState<{ has_token: boolean; has_page_id: boolean; page_id?: string } | null>(null);
+  const [showFbAuthModal, setShowFbAuthModal] = useState(false);
 
   // Form states
   const [urlOrFile, setUrlOrFile] = useState('');
@@ -98,7 +129,6 @@ export default function App() {
   const [copyrightGuard, setCopyrightGuard] = useState(true);
   const [stripStreamerVoice, setStripStreamerVoice] = useState(false);
   const [voiceoverPacing, setVoiceoverPacing] = useState<'hook_only' | 'full_commentary'>('hook_only');
-  const [enableCalloutOverlay, setEnableCalloutOverlay] = useState(false);
   const [cutStartTime, setCutStartTime] = useState('00:00:00');
   const [cutDurationMins, setCutDurationMins] = useState<number>(20);
   const [autoCutLong, setAutoCutLong] = useState(true);
@@ -118,8 +148,6 @@ export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [selectedClipIndex, setSelectedClipIndex] = useState(0);
   const [showSafeZones, setShowSafeZones] = useState(true);
-  const [isRegeneratingVoice, setIsRegeneratingVoice] = useState(false);
-  const [isRenderingClip, setIsRenderingClip] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [resetBanner, setResetBanner] = useState<string | null>(null);
   const [activityLogs, setActivityLogs] = useState<{ timestamp: string; message: string }[]>([]);
@@ -171,6 +199,26 @@ export default function App() {
         if (data.image_model) setImageModel(data.image_model);
       })
       .catch(() => {});
+
+    // Automatically restore active or completed job on initial page load
+    fetch('/api/jobs/latest')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((job) => {
+        if (job && job.job_id) {
+          setActiveJobId(job.job_id);
+          setProgressPct(job.progress_pct || 0);
+          setProgressMsg(job.step || '');
+          if (job.status === 'completed') {
+            setPipelineStep('completed');
+          }
+          if (job.metadata) setJobMetadata(job.metadata);
+          if (job.clips && job.clips.length > 0) {
+            setClips(job.clips);
+            setActiveTab('studio');
+          }
+        }
+      })
+      .catch((err) => console.warn('Could not restore latest job:', err));
   }, []);
 
   const handleLaunch = async () => {
@@ -195,14 +243,14 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url_or_path: urlOrFile,
-          mode: operatingMode,
+          mode: 'auto_pilot',
           target_language: language,
           clip_length_range: clipLength,
           clip_count: clipCount,
           copyright_guard: copyrightGuard,
           strip_streamer_voice: stripStreamerVoice,
           voiceover_pacing: voiceoverPacing,
-          enable_callout_overlay: enableCalloutOverlay,
+          enable_callout_overlay: false,
           cut_start_time: cutStartTime,
           cut_duration_mins: cutDurationMins,
           auto_cut_long_videos: autoCutLong,
@@ -245,13 +293,10 @@ export default function App() {
               if (msg.data) {
                 if (msg.data.clips) setClips(msg.data.clips);
                 if (msg.data.metadata) setJobMetadata(msg.data.metadata);
-                if (operatingMode === 'manual_studio') {
-                  setActiveTab('studio');
-                }
+                setActiveTab('studio');
               }
             }
           } else if (msg.event === 'clip_rendered') {
-            setIsRenderingClip(false);
             setClips((prev) =>
               prev.map((c) =>
                 c.clip_id === msg.clip_id
@@ -356,41 +401,6 @@ export default function App() {
     }
   };
 
-  const handleRegenerateVoice = async () => {
-    if (!activeJobId || clips.length === 0) return;
-    const currentClip = clips[selectedClipIndex];
-    setIsRegeneratingVoice(true);
-    try {
-      const res = await fetch(`/api/jobs/${activeJobId}/clips/${currentClip.clip_id}/regenerate-voice`, {
-        method: 'POST',
-      });
-      const data = await res.json();
-      if (data.voice_path) {
-        handleUpdateCurrentClip({ voice_path: data.voice_path });
-        alert(`New voiceover synthesized successfully for ${currentClip.clip_id}!`);
-      }
-    } catch (e) {
-      console.error(e);
-      alert('Failed to regenerate voice.');
-    } finally {
-      setIsRegeneratingVoice(false);
-    }
-  };
-
-  const handleRenderClip = async () => {
-    if (!activeJobId || !activeClip) return;
-    setIsRenderingClip(true);
-    try {
-      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/render`, {
-        method: 'POST',
-      });
-    } catch (e) {
-      console.error(e);
-      alert('Failed to trigger clip render.');
-      setIsRenderingClip(false);
-    }
-  };
-
   // 1-Click Export Pack: Downloads MP4 & copies formatted captions/tags to clipboard
   const handleExportPack = () => {
     if (!activeClip) return;
@@ -408,7 +418,9 @@ export default function App() {
     // 2. Trigger direct MP4 download if available
     if (activeClip.preview_url) {
       const a = document.createElement('a');
-      a.href = activeClip.preview_url;
+      a.href = activeJobId
+        ? `/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/download`
+        : activeClip.preview_url;
       a.download = `GTA6_${activeClip.clip_id}_Short.mp4`;
       document.body.appendChild(a);
       a.click();
@@ -471,6 +483,206 @@ export default function App() {
 
   const activeClip = clips[selectedClipIndex];
 
+  // Synchronize active clip metadata with YouTube Direct form
+  useEffect(() => {
+    if (activeClip) {
+      const sm = activeClip.social_metadata?.youtube;
+      setYtTitle(sm?.title || `${activeClip.hook_text} #Shorts`);
+      setYtDescription(sm?.description || `${activeClip.hook_summary}\n\n#GTA6 #GrandTheftAuto #Gaming #Shorts #Viral`);
+      setYtTags(sm?.tags || ['GTA6', 'Shorts', 'Gaming', 'GrandTheftAuto']);
+    }
+  }, [selectedClipIndex, clips]);
+
+  useEffect(() => {
+    const tmrw = new Date();
+    tmrw.setDate(tmrw.getDate() + 1);
+    setYtScheduleDate(tmrw.toISOString().split('T')[0]);
+  }, []);
+
+  const fetchYtAuthStatus = () => {
+    fetch('/api/youtube/status')
+      .then((res) => res.json())
+      .then((data) => setYtAuthStatus(data))
+      .catch((err) => console.warn('Could not fetch YouTube auth status:', err));
+  };
+
+  useEffect(() => {
+    fetchYtAuthStatus();
+  }, []);
+
+  const handlePublishYouTubeDirect = async () => {
+    if (!activeJobId || !activeClip) return;
+    if (!activeClip.preview_url) {
+      alert('This clip is still rendering. Please wait until rendering completes.');
+      return;
+    }
+    setYtPublishing(true);
+    setYtPublishError(null);
+    setYtPublishResult(null);
+
+    let publishAtIso: string | undefined = undefined;
+    if (ytPrivacy === 'scheduled') {
+      if (!ytScheduleDate || !ytScheduleTime) {
+        alert('Please choose both a schedule date and time.');
+        setYtPublishing(false);
+        return;
+      }
+      try {
+        const localDt = new Date(`${ytScheduleDate}T${ytScheduleTime}:00`);
+        publishAtIso = localDt.toISOString();
+      } catch (err) {
+        alert('Invalid schedule date or time.');
+        setYtPublishing(false);
+        return;
+      }
+    }
+
+    try {
+      const res = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/publish/youtube`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: ytTitle,
+          description: ytDescription,
+          tags: ytTags,
+          privacy: ytPrivacy,
+          publish_at: publishAtIso,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'YouTube API upload failed.');
+      }
+      setYtPublishResult({ url: data.url, video_id: data.video_id });
+      setPublishUrls((prev) => ({ ...prev, youtube: data.url }));
+    } catch (err: any) {
+      console.error('YouTube publish error:', err);
+      setYtPublishError(err.message || 'Failed to publish to YouTube.');
+    } finally {
+      setYtPublishing(false);
+    }
+  };
+
+  const handleOpenStudioUploader = () => {
+    const fullText = `TITLE:\n${ytTitle}\n\nDESCRIPTION:\n${ytDescription}\n\nTAGS:\n${ytTags.join(', ')}`;
+    navigator.clipboard.writeText(fullText);
+    setCopiedToast(true);
+    setTimeout(() => setCopiedToast(false), 3000);
+    window.open('https://studio.youtube.com/channel/videos/upload?d=pt', '_blank');
+  };
+
+  const handleSaveClientSecret = async () => {
+    if (!ytSecretContent.trim()) {
+      alert('Please paste the client_secret.json contents.');
+      return;
+    }
+    try {
+      JSON.parse(ytSecretContent);
+      const res = await fetch('/api/youtube/client-secret', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: ytSecretContent }),
+      });
+      if (res.ok) {
+        alert('Client secret saved successfully!');
+        setShowYtAuthModal(false);
+        fetchYtAuthStatus();
+      } else {
+        const d = await res.json();
+        alert(d.detail || 'Failed to save secret.');
+      }
+    } catch (e: any) {
+      alert('Invalid JSON content. Please ensure you pasted the exact client_secret.json file.');
+    }
+  };
+
+  // Synchronize active clip metadata with Facebook form
+  useEffect(() => {
+    if (activeClip) {
+      const sm = activeClip.social_metadata?.facebook;
+      setFbCaption(sm?.caption || `🔥 Epic GTA 6 Moment: ${activeClip.hook_text}! What a scene.`);
+      setFbHashtags(sm?.hashtags || ['#GTA6', '#GrandTheftAuto', '#ViceCity', '#Gaming', '#Reels', '#Viral']);
+    }
+  }, [selectedClipIndex, clips]);
+
+  const fetchFbAuthStatus = () => {
+    fetch('/api/facebook/status')
+      .then((res) => res.json())
+      .then((data) => {
+        setFbAuthStatus(data);
+        if (data.page_id && !fbPageId) {
+          setFbPageId(data.page_id);
+        }
+      })
+      .catch((err) => console.warn('Could not fetch Facebook status:', err));
+  };
+
+  useEffect(() => {
+    fetchFbAuthStatus();
+  }, []);
+
+  const handlePublishFacebookDirect = async () => {
+    if (!activeJobId || !activeClip) return;
+    if (!activeClip.preview_url) {
+      alert('This clip is still rendering. Please wait until rendering completes.');
+      return;
+    }
+    setFbPublishing(true);
+    setFbPublishError(null);
+    setFbPublishResult(null);
+
+    let scheduledEpoch: number | undefined = undefined;
+    if (fbState === 'SCHEDULED') {
+      if (!fbScheduleDate || !fbScheduleTime) {
+        alert('Please select both a schedule date and time.');
+        setFbPublishing(false);
+        return;
+      }
+      try {
+        const localDt = new Date(`${fbScheduleDate}T${fbScheduleTime}:00`);
+        scheduledEpoch = Math.floor(localDt.getTime() / 1000);
+      } catch (e) {
+        alert('Invalid schedule date or time.');
+        setFbPublishing(false);
+        return;
+      }
+    }
+
+    try {
+      const res = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/publish/facebook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          caption: fbCaption,
+          hashtags: fbHashtags,
+          video_state: fbState,
+          scheduled_publish_time: scheduledEpoch,
+          page_id: fbPageId || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Facebook Reels upload failed.');
+      }
+      setFbPublishResult({ url: data.url, video_id: data.video_id });
+      setPublishUrls((prev) => ({ ...prev, facebook: data.url }));
+    } catch (err: any) {
+      console.error('Facebook publish error:', err);
+      setFbPublishError(err.message || 'Failed to publish to Facebook Reels.');
+    } finally {
+      setFbPublishing(false);
+    }
+  };
+
+  const handleOpenMetaSuite = () => {
+    const fullText = `${fbCaption}\n\n${fbHashtags.join(' ')}`;
+    navigator.clipboard.writeText(fullText);
+    setCopiedToast(true);
+    setTimeout(() => setCopiedToast(false), 3000);
+    window.open('https://business.facebook.com/creatorstudio/reels', '_blank');
+  };
+
   return (
     <div className="flex h-screen w-screen bg-[#0B0D12] text-[#F8FAFC] font-sans antialiased overflow-hidden">
       {/* ─────────────────────────────────────────────────────────────
@@ -500,7 +712,7 @@ export default function App() {
               }`}
             >
               <FolderPlus className="h-4 w-4" />
-              <span>1. New Project</span>
+              <span>1. AI Launchpad</span>
             </button>
 
             <button
@@ -511,13 +723,43 @@ export default function App() {
                   : 'text-slate-400 hover:text-white hover:bg-[#141821]'
               }`}
             >
-              <Sliders className="h-4 w-4" />
-              <span>2. AI Studio</span>
+              <PlayCircle className="h-4 w-4" />
+              <span>2. AI Shorts Player</span>
               {clips.length > 0 && (
-                <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-600 text-white">
+                <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-600 text-white">
                   {clips.length}
                 </span>
               )}
+            </button>
+
+            <button
+              onClick={() => setActiveTab('youtube')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-medium transition-all ${
+                activeTab === 'youtube'
+                  ? 'bg-red-600/20 text-red-400 border border-red-500/40 shadow-sm shadow-red-950/20'
+                  : 'text-slate-400 hover:text-white hover:bg-[#141821]'
+              }`}
+            >
+              <Youtube className="h-4 w-4 text-red-500" />
+              <span className="font-semibold text-white">3. YouTube Direct Hub</span>
+              <span className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-600/30 text-red-300 font-mono">
+                DIRECT
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('facebook')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-medium transition-all ${
+                activeTab === 'facebook'
+                  ? 'bg-blue-600/20 text-blue-400 border border-blue-500/40 shadow-sm shadow-blue-950/20'
+                  : 'text-slate-400 hover:text-white hover:bg-[#141821]'
+              }`}
+            >
+              <Facebook className="h-4 w-4 text-blue-500" />
+              <span className="font-semibold text-white">4. Facebook Reels Hub</span>
+              <span className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-600/30 text-blue-300 font-mono">
+                REELS
+              </span>
             </button>
 
             <button
@@ -529,7 +771,7 @@ export default function App() {
               }`}
             >
               <Share2 className="h-4 w-4" />
-              <span>3. Upload Hub</span>
+              <span>5. Multi-Platform Hub</span>
             </button>
 
             <button
@@ -541,7 +783,7 @@ export default function App() {
               }`}
             >
               <SettingsIcon className="h-4 w-4" />
-              <span>4. Settings</span>
+              <span>6. AI Engine Settings</span>
             </button>
           </nav>
         </div>
@@ -577,33 +819,17 @@ export default function App() {
         {/* Top Header Bar */}
         <header className="h-16 border-b border-[#1F2430] px-8 flex items-center justify-between bg-[#0E1117]/80 backdrop-blur-md shrink-0">
           <div className="flex items-center gap-3">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Operating Mode:
-            </span>
-            <div className="flex bg-[#141821] p-1 rounded-xl border border-[#1F2430]">
-              <button
-                onClick={() => setOperatingMode('auto_pilot')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  operatingMode === 'auto_pilot'
-                    ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-md shadow-indigo-600/30'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Bot className="h-3.5 w-3.5" />
-                <span>🤖 Auto-Pilot</span>
-              </button>
-              <button
-                onClick={() => setOperatingMode('manual_studio')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  operatingMode === 'manual_studio'
-                    ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 text-white shadow-md shadow-emerald-600/30'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-                <span>🎛️ Manual Studio</span>
-              </button>
+            <div className="flex items-center gap-2.5 px-3.5 py-1.5 rounded-xl bg-indigo-600/15 border border-indigo-500/30 text-indigo-300 font-semibold text-xs shadow-inner">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+              </span>
+              <Bot className="h-4 w-4 text-indigo-400" />
+              <span>100% Autonomous AI Pipeline</span>
             </div>
+            <span className="text-[11px] text-slate-500 font-mono hidden md:inline">
+              Gemini Vision • Zero-Touch Director • Auto NVENC Render
+            </span>
           </div>
 
           <div className="flex items-center gap-3 text-xs">
@@ -840,31 +1066,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Visual Graphics Options */}
-                <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-3">
-                  <div className="flex items-center gap-2.5">
-                    <Sparkles className="h-4 w-4 text-purple-400" />
-                    <div>
-                      <span className="text-xs font-bold text-white">Top Graphic Callout Badges</span>
-                      <p className="text-[10px] text-slate-400">Burn in artificial callout boxes/stickers across the top (Default OFF for 100% clean video with subtitles only).</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] font-semibold text-slate-400">{enableCalloutOverlay ? 'Show Stickers' : 'Clean (No Badges)'}</span>
-                    <button
-                      onClick={() => setEnableCalloutOverlay(!enableCalloutOverlay)}
-                      className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
-                        enableCalloutOverlay ? 'bg-purple-600' : 'bg-slate-700'
-                      }`}
-                    >
-                      <div
-                        className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${
-                          enableCalloutOverlay ? 'translate-x-5' : 'translate-x-0'
-                        }`}
-                      />
-                    </button>
-                  </div>
-                </div>
+
 
                 {/* Video Cutter & AI Analysis Window */}
                 <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl mt-3">
@@ -1418,7 +1620,7 @@ export default function App() {
                       </p>
                       {activeClip && (
                         <p className="text-[10px] text-indigo-400 font-semibold mt-2">
-                          {isRenderingClip ? '⏳ Rendering 60fps Short...' : 'Click "Render This Short" to view'}
+                          ⏳ Autonomous AI rendering in progress...
                         </p>
                       )}
                     </div>
@@ -1456,158 +1658,1089 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Active Hook Sticker Overlay Preview */}
-                  {activeClip && !activeClip.preview_url && (
-                    <div className="absolute top-16 inset-x-4 pointer-events-none text-center">
-                      <div className="inline-block bg-[#131821]/90 border-2 border-indigo-500 rounded-xl px-4 py-2 shadow-2xl">
-                        <p className="text-xs font-black text-white tracking-wide uppercase">
-                          {activeClip.hook_text}
-                        </p>
-                      </div>
-                    </div>
-                  )}
+                  {/* Clean preview - callout box removed */}
                 </div>
               </div>
 
-              {/* Right Panel: Script Editor, Voice & Crop Controls */}
+              {/* Right Panel: AI Director Intelligence & Instant Export */}
               {activeClip && (
-                <div className="w-96 shrink-0 bg-[#141821] rounded-2xl border border-[#1F2430] p-5 flex flex-col gap-4 overflow-y-auto">
-                  <div className="flex items-center justify-between pb-2 border-b border-[#1F2430]">
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                      Clip Refinement ({activeClip.clip_id})
-                    </h3>
-                    <span className="text-[10px] text-emerald-400 font-mono">
-                      {activeClip.duration}s
+                <div className="w-96 shrink-0 bg-[#141821] rounded-2xl border border-[#1F2430] p-5 flex flex-col gap-4 overflow-y-auto shadow-xl">
+                  <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
+                    <div>
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-indigo-400">Autonomous Cut</span>
+                      <h3 className="text-sm font-bold text-white tracking-tight">
+                        Clip #{selectedClipIndex + 1}: {activeClip.hook_text}
+                      </h3>
+                    </div>
+                    <div className="flex items-center gap-1 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 rounded-full">
+                      <TrendingUp className="h-3 w-3 text-emerald-400" />
+                      <span className="text-xs font-bold text-emerald-400 font-mono">
+                        {activeClip.virality_score}/100
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* AI Virality Analysis */}
+                  <div className="bg-[#0B0D12] rounded-xl p-3 border border-[#1F2430]">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 mb-1">
+                      <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+                      <span>Gemini Hook & Virality Analysis</span>
+                    </div>
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      {activeClip.hook_summary}
+                    </p>
+                  </div>
+
+                  {/* AI Generated Commentary */}
+                  <div className="bg-[#0B0D12] rounded-xl p-3 border border-[#1F2430]">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-300 mb-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <Volume2 className="h-3.5 w-3.5 text-cyan-400" />
+                        <span>AI Voiceover Script</span>
+                      </div>
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        Voice: {activeClip.tts_voice || 'Puck'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 italic bg-[#141821] p-2.5 rounded-lg border border-[#1F2430]/60">
+                      "{activeClip.commentary_script}"
+                    </p>
+                  </div>
+
+                  {/* Automated Production Decisions */}
+                  <div className="space-y-1.5">
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                      Autonomous Production Decisions
+                    </label>
+                    <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                      <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
+                        <Check className="h-3 w-3 text-emerald-400 shrink-0" />
+                        <span className="truncate">9:16 {activeClip.crop_mode}</span>
+                      </div>
+                      <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
+                        <Check className="h-3 w-3 text-emerald-400 shrink-0" />
+                        <span className="truncate">60fps NVENC High</span>
+                      </div>
+                      <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
+                        <Check className="h-3 w-3 text-emerald-400 shrink-0" />
+                        <span className="truncate">Hormozi Captions</span>
+                      </div>
+                      <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
+                        <Check className="h-3 w-3 text-emerald-400 shrink-0" />
+                        <span className="truncate">-14 LUFS Audio</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Quick Export & Actions */}
+                  <div className="pt-2 space-y-2 mt-auto">
+                    {activeClip.preview_url ? (
+                      <a
+                        href={activeJobId ? `/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/download` : activeClip.preview_url}
+                        download={`GTA6_${activeClip.clip_id}_Short.mp4`}
+                        className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:opacity-95 text-white font-bold py-3 px-4 rounded-xl shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2 text-xs transition-all"
+                      >
+                        <Download className="h-4 w-4" />
+                        <span>📥 Download 1080x1920 Short (MP4)</span>
+                      </a>
+                    ) : (
+                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-center">
+                        <p className="text-xs text-amber-300 font-semibold">⏳ In autonomous render queue...</p>
+                      </div>
+                    )}
+
+                    <button
+                      onClick={handleExportPack}
+                      className="w-full bg-[#0B0D12] hover:bg-[#1A202C] border border-[#1F2430] text-slate-200 font-semibold py-2.5 px-4 rounded-xl flex items-center justify-center gap-2 text-xs transition-colors"
+                    >
+                      {copiedToast ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4 text-indigo-400" />}
+                      <span>{copiedToast ? '✓ Copied Title & Hashtags!' : '📋 Copy YouTube Title & Description'}</span>
+                    </button>
+
+                    <button
+                      onClick={() => setActiveTab('youtube')}
+                      className="w-full bg-red-600/20 hover:bg-red-600/30 border border-red-500/40 text-red-300 font-bold py-2.5 px-4 rounded-xl flex items-center justify-center gap-2 text-xs transition-colors shadow-sm shadow-red-950/20"
+                    >
+                      <Youtube className="h-4 w-4 text-red-400" />
+                      <span>🚀 Publish to YouTube Directly</span>
+                    </button>
+
+                    <button
+                      onClick={() => setActiveTab('upload')}
+                      className="w-full bg-indigo-600/15 hover:bg-indigo-600/25 border border-indigo-500/30 text-indigo-300 font-semibold py-2 px-4 rounded-xl flex items-center justify-center gap-2 text-xs transition-colors"
+                    >
+                      <Share2 className="h-3.5 w-3.5" />
+                      <span>Open Multi-Platform Hub</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* VIEW: DEDICATED YOUTUBE DIRECT PUBLISHING HUB */}
+          {activeTab === 'youtube' && (
+            <div className="max-w-6xl mx-auto space-y-6">
+              {/* Top Banner */}
+              <div className="flex flex-col md:flex-row md:items-center justify-between bg-[#141821] border border-[#1F2430] rounded-2xl p-6 shadow-xl gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="h-12 w-12 rounded-2xl bg-red-600/20 border border-red-500/40 flex items-center justify-center text-red-500 shadow-lg shadow-red-950/40 shrink-0">
+                    <Youtube className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-xl font-bold text-white tracking-tight">YouTube Shorts Direct Publisher</h2>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-red-600/30 text-red-300 font-bold border border-red-500/40">
+                        DIRECT API
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Directly upload your vertical 1080x1920 60fps Shorts to YouTube with auto-generated viral titles, descriptions, and schedule times.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => setShowYtAuthModal(true)}
+                    className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#0B0D12] border border-[#1F2430] hover:border-slate-600 text-slate-300 hover:text-white text-xs font-semibold transition-all"
+                  >
+                    <SettingsIcon className="h-3.5 w-3.5 text-slate-400" />
+                    <span>{ytAuthStatus?.has_client_secret ? '🔑 OAuth Configured' : '⚙️ Setup OAuth Secret'}</span>
+                  </button>
+
+                  <button
+                    onClick={handleOpenStudioUploader}
+                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1A1F2C] hover:bg-[#252C3D] border border-indigo-500/30 text-indigo-300 font-bold text-xs transition-all shadow-md"
+                    title="Copies all metadata and opens studio.youtube.com upload page"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5 text-indigo-400" />
+                    <span>{copiedToast ? '✓ Copied & Opened!' : 'Open in YouTube Studio'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Horizontal Clip Selector Bar */}
+              {clips.length > 0 && (
+                <div className="bg-[#141821] border border-[#1F2430] rounded-2xl p-4 shadow-md">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <PlayCircle className="h-4 w-4 text-red-400" />
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                        Select Clip to Publish ({clips.length} ready)
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      Selected: Clip #{selectedClipIndex + 1} ({activeClip?.duration || 0}s)
                     </span>
                   </div>
 
-                  {/* Commentary Script Box */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      Commentary Script (Gemini Director)
-                    </label>
-                    <textarea
-                      rows={4}
-                      value={activeClip.commentary_script}
-                      onChange={(e) => handleUpdateCurrentClip({ commentary_script: e.target.value })}
-                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl p-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 resize-none font-sans leading-relaxed"
-                    />
-                    <div className="flex gap-2 mt-2">
-                      <select
-                        value={activeClip.tts_voice || 'Puck'}
-                        onChange={(e) => handleUpdateCurrentClip({ tts_voice: e.target.value })}
-                        className="w-1/2 bg-[#0B0D12] border border-[#1F2430] rounded-lg px-2 py-1.5 text-xs text-white"
-                      >
-                        <option value="Puck">Voice: Puck (Energetic)</option>
-                        <option value="Fenrir">Voice: Fenrir (Deep Hype)</option>
-                        <option value="Zephyr">Voice: Zephyr (Fast)</option>
-                        <option value="Aoede">Voice: Aoede (Dramatic)</option>
-                        <option value="Kore">Voice: Kore (Chill)</option>
-                      </select>
-                      <button
-                        onClick={handleRegenerateVoice}
-                        disabled={isRegeneratingVoice}
-                        className="w-1/2 flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-xs font-semibold transition-all disabled:opacity-50"
-                      >
-                        <RotateCw className={`h-3 w-3 ${isRegeneratingVoice ? 'animate-spin' : ''}`} />
-                        <span>{isRegeneratingVoice ? 'Generating...' : 'Re-Voice'}</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Crop Mode Switcher */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      9:16 Crop Mode
-                    </label>
-                    <div className="grid grid-cols-3 gap-2">
-                      {(['action_track', 'facecam_split', 'center_zoom'] as const).map((mode) => (
-                        <button
-                          key={mode}
-                          onClick={() => handleUpdateCurrentClip({ crop_mode: mode })}
-                          className={`p-2 rounded-lg border text-[11px] font-medium text-center transition-colors ${
-                            activeClip.crop_mode === mode
-                              ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300 font-bold'
-                              : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          {mode === 'action_track' && 'Action Pan'}
-                          {mode === 'facecam_split' && 'Face Split'}
-                          {mode === 'center_zoom' && 'Center Blur'}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Caption Style Presets */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      Caption Style Preset
-                    </label>
-                    <div className="grid grid-cols-3 gap-2">
-                      <button
-                        onClick={() => handleUpdateCurrentClip({ caption_style: 'hormozi_yellow' })}
-                        className={`p-2 rounded-lg border text-[11px] font-medium text-center transition-colors ${
-                          activeClip.caption_style === 'hormozi_yellow'
-                            ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold'
-                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400'
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                    {clips.map((c, idx) => (
+                      <div
+                        key={c.clip_id}
+                        onClick={() => setSelectedClipIndex(idx)}
+                        className={`p-3 rounded-xl border cursor-pointer transition-all ${
+                          selectedClipIndex === idx
+                            ? 'bg-red-600/15 border-red-500/60 shadow-lg shadow-red-950/30 ring-1 ring-red-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] hover:border-slate-700'
                         }`}
                       >
-                        Hormozi Yellow
-                      </button>
-                      <button
-                        onClick={() => handleUpdateCurrentClip({ caption_style: 'neon_cyan' })}
-                        className={`p-2 rounded-lg border text-[11px] font-medium text-center transition-colors ${
-                          activeClip.caption_style === 'neon_cyan'
-                            ? 'bg-cyan-500/20 border-cyan-500 text-cyan-300 font-bold'
-                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400'
-                        }`}
-                      >
-                        Neon Cyan
-                      </button>
-                      <button
-                        onClick={() => handleUpdateCurrentClip({ caption_style: 'clean_white' })}
-                        className={`p-2 rounded-lg border text-[11px] font-medium text-center transition-colors ${
-                          activeClip.caption_style === 'clean_white'
-                            ? 'bg-white/20 border-white text-white font-bold'
-                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400'
-                        }`}
-                      >
-                        Clean White
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Callout Overlay Graphic Preview */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      Generated Callout Overlay
-                    </label>
-                    <div className="p-3 bg-[#0B0D12] rounded-xl border border-[#1F2430] text-center">
-                      <div className="inline-block bg-[#131821] border border-indigo-500 rounded-lg px-3 py-1.5 text-xs font-bold text-white uppercase">
-                        {activeClip.hook_text}
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-bold text-white uppercase">Clip #{idx + 1}</span>
+                          <span className="text-[10px] font-mono text-emerald-400 font-bold">{c.virality_score}/100</span>
+                        </div>
+                        <p className="text-[11px] font-medium text-slate-300 line-clamp-1">{c.hook_text}</p>
+                        <div className="flex items-center justify-between mt-2 pt-1 border-t border-[#1F2430]/60 text-[9px] text-slate-400 font-mono">
+                          <span>{c.duration}s</span>
+                          <span className={c.preview_url ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
+                            {c.preview_url ? '✓ Ready' : '⏳ Rendering'}
+                          </span>
+                        </div>
                       </div>
-                      <p className="text-[10px] text-slate-500 mt-2 font-mono">
-                        Prompt: {activeClip.overlay_prompt}
-                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Main 2-Column Publishing Studio */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                {/* Left Column: 9:16 Video Player Card (5 cols) */}
+                <div className="lg:col-span-5 bg-[#141821] rounded-2xl border border-[#1F2430] p-5 shadow-xl flex flex-col items-center justify-between space-y-4">
+                  <div className="w-full flex items-center justify-between pb-3 border-b border-[#1F2430]">
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Shorts Video Preview</span>
+                    <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30 font-bold">
+                      1080x1920 60FPS NVENC
+                    </span>
+                  </div>
+
+                  {/* 9:16 Vertical Video Frame */}
+                  <div className="relative aspect-[9/16] w-full max-w-[280px] rounded-2xl overflow-hidden bg-black border-2 border-[#1F2430] shadow-2xl flex items-center justify-center">
+                    {activeClip?.preview_url ? (
+                      <video
+                        key={activeClip.preview_url}
+                        src={activeClip.preview_url}
+                        controls
+                        autoPlay
+                        loop
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="text-center p-6 text-slate-600">
+                        <Video className="h-10 w-10 mx-auto mb-2 text-red-500/50" />
+                        <p className="text-xs font-semibold text-slate-400">Rendering Clip...</p>
+                        <p className="text-[10px] text-slate-500 mt-1">Autonomous hardware encoder active</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Video Specs & Local Download */}
+                  <div className="w-full space-y-2 pt-2 border-t border-[#1F2430]">
+                    <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-400">
+                      <div className="bg-[#0B0D12] p-2 rounded-lg border border-[#1F2430]">
+                        <span className="text-slate-500 block text-[9px] uppercase">Format</span>
+                        <span className="text-white font-bold">MP4 (mp42)</span>
+                      </div>
+                      <div className="bg-[#0B0D12] p-2 rounded-lg border border-[#1F2430]">
+                        <span className="text-slate-500 block text-[9px] uppercase">Audio</span>
+                        <span className="text-white font-bold">AAC Stereo -14 LUFS</span>
+                      </div>
+                    </div>
+
+                    {activeClip?.preview_url && (
+                      <a
+                        href={activeJobId ? `/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/download` : activeClip.preview_url}
+                        download={`GTA6_${activeClip.clip_id}_Short.mp4`}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-[#0B0D12] hover:bg-[#191F2C] border border-[#1F2430] text-slate-300 hover:text-white font-semibold text-xs transition-colors"
+                      >
+                        <Download className="h-3.5 w-3.5 text-emerald-400" />
+                        <span>Download MP4 for Backup</span>
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                {/* Right Column: Detailed YouTube Metadata & Upload Form (7 cols) */}
+                <div className="lg:col-span-7 bg-[#141821] rounded-2xl border border-[#1F2430] p-6 shadow-xl space-y-5">
+                  {/* Results Banner (if uploaded) */}
+                  {ytPublishResult && (
+                    <div className="bg-emerald-500/15 border border-emerald-500/40 rounded-xl p-4 shadow-lg flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <CheckCircle2 className="h-6 w-6 text-emerald-400 shrink-0" />
+                        <div>
+                          <h4 className="text-xs font-bold text-white">Successfully Uploaded to YouTube Shorts!</h4>
+                          <p className="text-[11px] text-emerald-300 font-mono mt-0.5">{ytPublishResult.url}</p>
+                        </div>
+                      </div>
+                      <a
+                        href={ytPublishResult.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500 text-black text-xs font-bold hover:bg-emerald-400 transition-colors"
+                      >
+                        <span>Watch Short</span>
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  )}
+
+                  {/* Error Banner */}
+                  {ytPublishError && (
+                    <div className="bg-rose-500/15 border border-rose-500/40 rounded-xl p-4 shadow-lg flex items-start gap-3">
+                      <AlertCircle className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <h4 className="text-xs font-bold text-white">Upload Error</h4>
+                        <p className="text-[11px] text-rose-300 mt-0.5 leading-relaxed">{ytPublishError}</p>
+                        {ytPublishError.includes('credentials') || ytPublishError.includes('OAuth') || ytPublishError.includes('client_secret') ? (
+                          <button
+                            onClick={() => setShowYtAuthModal(true)}
+                            className="mt-2 text-xs text-indigo-400 underline font-semibold"
+                          >
+                            Click here to configure client_secret.json
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 1. Title Input */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                        <span>Shorts Title</span>
+                        <span className="text-red-400">*</span>
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <span className={`text-[11px] font-mono ${ytTitle.length > 90 ? 'text-amber-400' : 'text-slate-400'}`}>
+                          {ytTitle.length}/100
+                        </span>
+                        <button
+                          onClick={() => {
+                            if (activeClip) {
+                              setYtTitle(activeClip.social_metadata?.youtube.title || `${activeClip.hook_text} #Shorts`);
+                            }
+                          }}
+                          className="text-[10px] text-indigo-400 hover:text-indigo-300 underline font-mono"
+                        >
+                          Reset AI Title
+                        </button>
+                      </div>
+                    </div>
+                    <input
+                      type="text"
+                      maxLength={100}
+                      value={ytTitle}
+                      onChange={(e) => setYtTitle(e.target.value)}
+                      placeholder="Catchy viral hook title with #Shorts"
+                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-4 py-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-red-500 font-semibold transition-colors"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1">
+                      💡 Tip: Keep #Shorts in your title to guarantee algorithmic vertical Shorts indexing.
+                    </p>
+                  </div>
+
+                  {/* 2. Description Textarea */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                        Description & Hashtags
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-mono text-slate-400">{ytDescription.length}/5000</span>
+                        <button
+                          onClick={() => {
+                            if (activeClip) {
+                              setYtDescription(activeClip.social_metadata?.youtube.description || `${activeClip.hook_summary}\n\n#GTA6 #GrandTheftAuto #Gaming #Shorts #Viral`);
+                            }
+                          }}
+                          className="text-[10px] text-indigo-400 hover:text-indigo-300 underline font-mono"
+                        >
+                          Reset AI Description
+                        </button>
+                      </div>
+                    </div>
+                    <textarea
+                      rows={5}
+                      maxLength={5000}
+                      value={ytDescription}
+                      onChange={(e) => setYtDescription(e.target.value)}
+                      placeholder="Detailed description and hashtags for YouTube SEO..."
+                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl p-3 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-red-500 resize-none font-sans leading-relaxed"
+                    />
+                  </div>
+
+                  {/* 3. Tags Badges */}
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-1.5">
+                      SEO Tags ({ytTags.length})
+                    </label>
+                    <div className="flex flex-wrap gap-1.5 p-2 bg-[#0B0D12] border border-[#1F2430] rounded-xl min-h-[42px] items-center">
+                      {ytTags.map((tag, tIdx) => (
+                        <span
+                          key={tIdx}
+                          className="flex items-center gap-1 bg-[#1A202C] border border-[#2D3748] text-slate-300 px-2 py-0.5 rounded-lg text-xs font-mono"
+                        >
+                          <span>#{tag.replace(/^#/, '')}</span>
+                          <button
+                            type="button"
+                            onClick={() => setYtTags(ytTags.filter((_, i) => i !== tIdx))}
+                            className="hover:text-rose-400"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                      <div className="flex items-center gap-1 pl-1">
+                        <input
+                          type="text"
+                          value={ytTagInput}
+                          onChange={(e) => setYtTagInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && ytTagInput.trim()) {
+                              e.preventDefault();
+                              const clean = ytTagInput.trim().replace(/^#/, '');
+                              if (!ytTags.includes(clean)) {
+                                setYtTags([...ytTags, clean]);
+                              }
+                              setYtTagInput('');
+                            }
+                          }}
+                          placeholder="+ Add tag (Enter)"
+                          className="bg-transparent text-xs text-white placeholder-slate-600 focus:outline-none w-28 font-mono"
+                        />
+                      </div>
                     </div>
                   </div>
 
-                  {/* Single Clip Render Action Button */}
-                  <div className="pt-2">
-                    <button
-                      onClick={handleRenderClip}
-                      disabled={isRenderingClip}
-                      className="w-full bg-gradient-to-r from-emerald-600 to-indigo-600 hover:opacity-95 text-white font-bold py-3 px-4 rounded-xl shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 text-xs transition-all disabled:opacity-50"
-                    >
-                      <Video className={`h-4 w-4 ${isRenderingClip ? 'animate-pulse' : ''}`} />
-                      <span>{isRenderingClip ? 'Hardware Rendering Short...' : '🚀 Render This Short (1080x1920 60fps)'}</span>
-                    </button>
-                    {activeClip.preview_url && (
-                      <p className="text-[10px] text-emerald-400 text-center mt-2 font-mono">
-                        ✓ Rendered & Ready in Upload Hub
-                      </p>
+                  {/* 4. Privacy & Scheduling Selector */}
+                  <div className="space-y-3 pt-2 border-t border-[#1F2430]">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-300">
+                      Visibility & Publishing Schedule
+                    </label>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                      {/* Public */}
+                      <button
+                        type="button"
+                        onClick={() => setYtPrivacy('public')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          ytPrivacy === 'public'
+                            ? 'bg-emerald-600/15 border-emerald-500 text-white shadow-md shadow-emerald-950/30 ring-1 ring-emerald-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Globe className={`h-4 w-4 ${ytPrivacy === 'public' ? 'text-emerald-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${ytPrivacy === 'public' ? 'bg-emerald-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Public</span>
+                          <span className="text-[10px] text-slate-400">Instant release</span>
+                        </div>
+                      </button>
+
+                      {/* Unlisted */}
+                      <button
+                        type="button"
+                        onClick={() => setYtPrivacy('unlisted')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          ytPrivacy === 'unlisted'
+                            ? 'bg-amber-600/15 border-amber-500 text-white shadow-md shadow-amber-950/30 ring-1 ring-amber-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <EyeOff className={`h-4 w-4 ${ytPrivacy === 'unlisted' ? 'text-amber-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${ytPrivacy === 'unlisted' ? 'bg-amber-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Unlisted</span>
+                          <span className="text-[10px] text-slate-400">Link-only access</span>
+                        </div>
+                      </button>
+
+                      {/* Private */}
+                      <button
+                        type="button"
+                        onClick={() => setYtPrivacy('private')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          ytPrivacy === 'private'
+                            ? 'bg-indigo-600/15 border-indigo-500 text-white shadow-md shadow-indigo-950/30 ring-1 ring-indigo-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Lock className={`h-4 w-4 ${ytPrivacy === 'private' ? 'text-indigo-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${ytPrivacy === 'private' ? 'bg-indigo-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Private</span>
+                          <span className="text-[10px] text-slate-400">Only you</span>
+                        </div>
+                      </button>
+
+                      {/* Schedule */}
+                      <button
+                        type="button"
+                        onClick={() => setYtPrivacy('scheduled')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          ytPrivacy === 'scheduled'
+                            ? 'bg-fuchsia-600/15 border-fuchsia-500 text-white shadow-md shadow-fuchsia-950/30 ring-1 ring-fuchsia-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Calendar className={`h-4 w-4 ${ytPrivacy === 'scheduled' ? 'text-fuchsia-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${ytPrivacy === 'scheduled' ? 'bg-fuchsia-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Schedule</span>
+                          <span className="text-[10px] text-slate-400">Set future date</span>
+                        </div>
+                      </button>
+                    </div>
+
+                    {/* Schedule Date & Time Picker */}
+                    {ytPrivacy === 'scheduled' && (
+                      <div className="bg-[#0B0D12] border border-fuchsia-500/40 rounded-xl p-4 shadow-inner space-y-3">
+                        <div className="flex items-center gap-2 text-fuchsia-300 text-xs font-bold">
+                          <Calendar className="h-4 w-4" />
+                          <span>Choose Scheduled Premiere Time (YouTube Shorts)</span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                              Publish Date
+                            </label>
+                            <input
+                              type="date"
+                              value={ytScheduleDate}
+                              onChange={(e) => setYtScheduleDate(e.target.value)}
+                              className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-fuchsia-500 font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                              Publish Time
+                            </label>
+                            <input
+                              type="time"
+                              value={ytScheduleTime}
+                              onChange={(e) => setYtScheduleTime(e.target.value)}
+                              className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-fuchsia-500 font-mono"
+                            />
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-slate-400 font-mono">
+                          ⏰ Will go public on: <span className="text-white font-bold">{ytScheduleDate || 'Select Date'} at {ytScheduleTime || '18:00'}</span>. The video will be uploaded as Private until this time.
+                        </p>
+                      </div>
                     )}
+                  </div>
+
+                  {/* Primary Direct Upload Button */}
+                  <div className="pt-3 border-t border-[#1F2430]">
+                    <button
+                      onClick={handlePublishYouTubeDirect}
+                      disabled={ytPublishing}
+                      className="w-full bg-gradient-to-r from-red-600 via-rose-600 to-red-700 hover:opacity-95 text-white font-bold py-3.5 px-6 rounded-xl shadow-xl shadow-red-950/40 flex items-center justify-center gap-2.5 text-sm transition-all disabled:opacity-50"
+                    >
+                      <Youtube className={`h-5 w-5 ${ytPublishing ? 'animate-bounce' : ''}`} />
+                      <span>
+                        {ytPublishing
+                          ? 'Uploading to YouTube Shorts directly...'
+                          : ytPrivacy === 'scheduled'
+                          ? `🚀 Schedule on YouTube Shorts (${ytScheduleDate} ${ytScheduleTime})`
+                          : `🚀 Publish to YouTube Shorts Directly [${ytPrivacy.toUpperCase()}]`}
+                      </span>
+                    </button>
+                    <p className="text-[10px] text-slate-500 text-center mt-2">
+                      Uses YouTube Data API v3 resumable chunk upload with automated 9:16 vertical tags.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* YouTube OAuth Setup Modal */}
+              {showYtAuthModal && (
+                <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                  <div className="bg-[#141821] border border-[#1F2430] rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+                    <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
+                      <div className="flex items-center gap-2 text-red-400">
+                        <Youtube className="h-5 w-5" />
+                        <h3 className="text-sm font-bold text-white">YouTube Channel OAuth Setup</h3>
+                      </div>
+                      <button onClick={() => setShowYtAuthModal(false)} className="text-slate-400 hover:text-white">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
+                      <p>
+                        To enable direct 1-click publishing to your YouTube channel without leaving the app, Google requires an OAuth 2.0 Client ID:
+                      </p>
+                      <ol className="list-decimal list-inside space-y-1 text-slate-400 text-[11px]">
+                        <li>Go to Google Cloud Console → APIs & Services → Credentials.</li>
+                        <li>Create an <strong>OAuth 2.0 Client ID</strong> (Desktop Application).</li>
+                        <li>Download the JSON and paste its contents below (or place as <code className="text-amber-300">client_secret.json</code> in project root).</li>
+                      </ol>
+
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                          Paste client_secret.json contents:
+                        </label>
+                        <textarea
+                          rows={6}
+                          value={ytSecretContent}
+                          onChange={(e) => setYtSecretContent(e.target.value)}
+                          placeholder='{"installed":{"client_id":"...","project_id":"...","auth_uri":"...","token_uri":"...","client_secret":"..."}}'
+                          className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl p-3 font-mono text-[11px] text-slate-300 focus:outline-none focus:border-red-500 resize-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#1F2430]">
+                      <button
+                        onClick={() => setShowYtAuthModal(false)}
+                        className="px-4 py-2 rounded-xl bg-[#0B0D12] text-slate-400 hover:text-white text-xs font-semibold"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSaveClientSecret}
+                        className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-md shadow-red-950/30"
+                      >
+                        Save & Connect Channel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* VIEW: DEDICATED FACEBOOK REELS DIRECT PUBLISHING HUB */}
+          {activeTab === 'facebook' && (
+            <div className="max-w-6xl mx-auto space-y-6">
+              {/* Top Banner */}
+              <div className="flex flex-col md:flex-row md:items-center justify-between bg-[#141821] border border-[#1F2430] rounded-2xl p-6 shadow-xl gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="h-12 w-12 rounded-2xl bg-blue-600/20 border border-blue-500/40 flex items-center justify-center text-blue-500 shadow-lg shadow-blue-950/40 shrink-0">
+                    <Facebook className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-xl font-bold text-white tracking-tight">Facebook Reels Direct Publisher</h2>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-600/30 text-blue-300 font-bold border border-blue-500/40">
+                        GRAPH API v21
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Directly upload your vertical 1080x1920 60fps Reels to your Facebook Page with auto-generated viral captions, hashtags, and schedule times.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => setShowFbAuthModal(true)}
+                    className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#0B0D12] border border-[#1F2430] hover:border-slate-600 text-slate-300 hover:text-white text-xs font-semibold transition-all"
+                  >
+                    <SettingsIcon className="h-3.5 w-3.5 text-slate-400" />
+                    <span>{fbAuthStatus?.has_token ? '🔑 Meta Token Connected' : '⚙️ Setup Meta Token'}</span>
+                  </button>
+
+                  <button
+                    onClick={handleOpenMetaSuite}
+                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1A1F2C] hover:bg-[#252C3D] border border-blue-500/30 text-blue-300 font-bold text-xs transition-all shadow-md"
+                    title="Copies caption + hashtags and opens Meta Business Suite Reels composer"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5 text-blue-400" />
+                    <span>{copiedToast ? '✓ Copied & Opened!' : 'Open in Meta Business Suite'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Horizontal Clip Selector Bar */}
+              {clips.length > 0 && (
+                <div className="bg-[#141821] border border-[#1F2430] rounded-2xl p-4 shadow-md">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <PlayCircle className="h-4 w-4 text-blue-400" />
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                        Select Clip to Publish ({clips.length} ready)
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      Selected: Clip #{selectedClipIndex + 1} ({activeClip?.duration || 0}s)
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                    {clips.map((c, idx) => (
+                      <div
+                        key={c.clip_id}
+                        onClick={() => setSelectedClipIndex(idx)}
+                        className={`p-3 rounded-xl border cursor-pointer transition-all ${
+                          selectedClipIndex === idx
+                            ? 'bg-blue-600/15 border-blue-500/60 shadow-lg shadow-blue-950/30 ring-1 ring-blue-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-bold text-white uppercase">Clip #{idx + 1}</span>
+                          <span className="text-[10px] font-mono text-emerald-400 font-bold">{c.virality_score}/100</span>
+                        </div>
+                        <p className="text-[11px] font-medium text-slate-300 line-clamp-1">{c.hook_text}</p>
+                        <div className="flex items-center justify-between mt-2 pt-1 border-t border-[#1F2430]/60 text-[9px] text-slate-400 font-mono">
+                          <span>{c.duration}s</span>
+                          <span className={c.preview_url ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
+                            {c.preview_url ? '✓ Ready' : '⏳ Rendering'}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Main 2-Column Publishing Studio */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                {/* Left Column: 9:16 Video Player Card (5 cols) */}
+                <div className="lg:col-span-5 bg-[#141821] rounded-2xl border border-[#1F2430] p-5 shadow-xl flex flex-col items-center justify-between space-y-4">
+                  <div className="w-full flex items-center justify-between pb-3 border-b border-[#1F2430]">
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Reels Video Preview</span>
+                    <span className="text-[10px] font-mono text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/30 font-bold">
+                      1080x1920 60FPS NVENC
+                    </span>
+                  </div>
+
+                  {/* 9:16 Vertical Video Frame */}
+                  <div className="relative aspect-[9/16] w-full max-w-[280px] rounded-2xl overflow-hidden bg-black border-2 border-[#1F2430] shadow-2xl flex items-center justify-center">
+                    {activeClip?.preview_url ? (
+                      <video
+                        key={activeClip.preview_url}
+                        src={activeClip.preview_url}
+                        controls
+                        autoPlay
+                        loop
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="text-center p-6 text-slate-600">
+                        <Video className="h-10 w-10 mx-auto mb-2 text-blue-500/50" />
+                        <p className="text-xs font-semibold text-slate-400">Rendering Clip...</p>
+                        <p className="text-[10px] text-slate-500 mt-1">Autonomous hardware encoder active</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Video Specs & Local Download */}
+                  <div className="w-full space-y-2 pt-2 border-t border-[#1F2430]">
+                    <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-400">
+                      <div className="bg-[#0B0D12] p-2 rounded-lg border border-[#1F2430]">
+                        <span className="text-slate-500 block text-[9px] uppercase">Format</span>
+                        <span className="text-white font-bold">MP4 (mp42)</span>
+                      </div>
+                      <div className="bg-[#0B0D12] p-2 rounded-lg border border-[#1F2430]">
+                        <span className="text-slate-500 block text-[9px] uppercase">Audio</span>
+                        <span className="text-white font-bold">AAC Stereo -14 LUFS</span>
+                      </div>
+                    </div>
+
+                    {activeClip?.preview_url && (
+                      <a
+                        href={activeJobId ? `/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/download` : activeClip.preview_url}
+                        download={`GTA6_${activeClip.clip_id}_Short.mp4`}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-[#0B0D12] hover:bg-[#191F2C] border border-[#1F2430] text-slate-300 hover:text-white font-semibold text-xs transition-colors"
+                      >
+                        <Download className="h-3.5 w-3.5 text-blue-400" />
+                        <span>Download MP4 for Backup</span>
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                {/* Right Column: Detailed Facebook Reels Form (7 cols) */}
+                <div className="lg:col-span-7 bg-[#141821] rounded-2xl border border-[#1F2430] p-6 shadow-xl space-y-5">
+                  {/* Results Banner (if uploaded) */}
+                  {fbPublishResult && (
+                    <div className="bg-emerald-500/15 border border-emerald-500/40 rounded-xl p-4 shadow-lg flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <CheckCircle2 className="h-6 w-6 text-emerald-400 shrink-0" />
+                        <div>
+                          <h4 className="text-xs font-bold text-white">Successfully Processed Facebook Reel!</h4>
+                          <p className="text-[11px] text-emerald-300 font-mono mt-0.5">{fbPublishResult.url}</p>
+                        </div>
+                      </div>
+                      <a
+                        href={fbPublishResult.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500 text-black text-xs font-bold hover:bg-emerald-400 transition-colors"
+                      >
+                        <span>View on Facebook</span>
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  )}
+
+                  {/* Error Banner */}
+                  {fbPublishError && (
+                    <div className="bg-rose-500/15 border border-rose-500/40 rounded-xl p-4 shadow-lg flex items-start gap-3">
+                      <AlertCircle className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <h4 className="text-xs font-bold text-white">Facebook Upload Error</h4>
+                        <p className="text-[11px] text-rose-300 mt-0.5 leading-relaxed">{fbPublishError}</p>
+                        {fbPublishError.includes('META_ACCESS_TOKEN') || fbPublishError.includes('META_PAGE_ID') ? (
+                          <button
+                            onClick={() => setShowFbAuthModal(true)}
+                            className="mt-2 text-xs text-blue-400 underline font-semibold"
+                          >
+                            Click here to configure Meta Token & Page ID
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 1. Facebook Page ID Input */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                        <span>Facebook Page ID</span>
+                        <span className="text-blue-400">*</span>
+                      </label>
+                      <span className="text-[11px] font-mono text-slate-500">
+                        {fbAuthStatus?.page_id ? `Configured in .env: ${fbAuthStatus.page_id}` : 'Required for Reels API'}
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      value={fbPageId}
+                      onChange={(e) => setFbPageId(e.target.value)}
+                      placeholder="e.g. 109283746581928"
+                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 font-mono transition-colors"
+                    />
+                  </div>
+
+                  {/* 2. Reels Caption Textarea */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                        <span>Reels Caption</span>
+                        <span className="text-blue-400">*</span>
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-mono text-slate-400">{fbCaption.length}/2000</span>
+                        <button
+                          onClick={() => {
+                            if (activeClip) {
+                              setFbCaption(activeClip.social_metadata?.facebook.caption || `🔥 Epic GTA 6 Moment: ${activeClip.hook_text}! What a scene.`);
+                            }
+                          }}
+                          className="text-[10px] text-blue-400 hover:text-blue-300 underline font-mono"
+                        >
+                          Reset AI Caption
+                        </button>
+                      </div>
+                    </div>
+                    <textarea
+                      rows={5}
+                      maxLength={2000}
+                      value={fbCaption}
+                      onChange={(e) => setFbCaption(e.target.value)}
+                      placeholder="Engaging caption for Facebook Reels viewers..."
+                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl p-3 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 resize-none font-sans leading-relaxed"
+                    />
+                  </div>
+
+                  {/* 3. Hashtags Badges */}
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-1.5">
+                      Reels Hashtags ({fbHashtags.length})
+                    </label>
+                    <div className="flex flex-wrap gap-1.5 p-2 bg-[#0B0D12] border border-[#1F2430] rounded-xl min-h-[42px] items-center">
+                      {fbHashtags.map((tag, tIdx) => (
+                        <span
+                          key={tIdx}
+                          className="flex items-center gap-1 bg-[#1A202C] border border-[#2D3748] text-blue-300 px-2 py-0.5 rounded-lg text-xs font-mono"
+                        >
+                          <span>{tag.startsWith('#') ? tag : `#${tag}`}</span>
+                          <button
+                            type="button"
+                            onClick={() => setFbHashtags(fbHashtags.filter((_, i) => i !== tIdx))}
+                            className="hover:text-rose-400"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                      <div className="flex items-center gap-1 pl-1">
+                        <input
+                          type="text"
+                          value={fbTagInput}
+                          onChange={(e) => setFbTagInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && fbTagInput.trim()) {
+                              e.preventDefault();
+                              const clean = '#' + fbTagInput.trim().replace(/^#/, '');
+                              if (!fbHashtags.includes(clean)) {
+                                setFbHashtags([...fbHashtags, clean]);
+                              }
+                              setFbTagInput('');
+                            }
+                          }}
+                          placeholder="+ Add hashtag (Enter)"
+                          className="bg-transparent text-xs text-white placeholder-slate-600 focus:outline-none w-32 font-mono"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 4. Visibility & Publishing Mode Selector */}
+                  <div className="space-y-3 pt-2 border-t border-[#1F2430]">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-300">
+                      Publishing State & Schedule
+                    </label>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                      {/* Publish Now */}
+                      <button
+                        type="button"
+                        onClick={() => setFbState('PUBLISHED')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          fbState === 'PUBLISHED'
+                            ? 'bg-blue-600/15 border-blue-500 text-white shadow-md shadow-blue-950/30 ring-1 ring-blue-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Globe className={`h-4 w-4 ${fbState === 'PUBLISHED' ? 'text-blue-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${fbState === 'PUBLISHED' ? 'bg-blue-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Publish Now</span>
+                          <span className="text-[10px] text-slate-400">Immediate live Reel</span>
+                        </div>
+                      </button>
+
+                      {/* Schedule */}
+                      <button
+                        type="button"
+                        onClick={() => setFbState('SCHEDULED')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          fbState === 'SCHEDULED'
+                            ? 'bg-fuchsia-600/15 border-fuchsia-500 text-white shadow-md shadow-fuchsia-950/30 ring-1 ring-fuchsia-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Calendar className={`h-4 w-4 ${fbState === 'SCHEDULED' ? 'text-fuchsia-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${fbState === 'SCHEDULED' ? 'bg-fuchsia-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Schedule Reel</span>
+                          <span className="text-[10px] text-slate-400">Pick date & time</span>
+                        </div>
+                      </button>
+
+                      {/* Draft */}
+                      <button
+                        type="button"
+                        onClick={() => setFbState('DRAFT')}
+                        className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
+                          fbState === 'DRAFT'
+                            ? 'bg-amber-600/15 border-amber-500 text-white shadow-md shadow-amber-950/30 ring-1 ring-amber-500/40'
+                            : 'bg-[#0B0D12] border-[#1F2430] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <Lock className={`h-4 w-4 ${fbState === 'DRAFT' ? 'text-amber-400' : 'text-slate-500'}`} />
+                          <span className={`h-2 w-2 rounded-full ${fbState === 'DRAFT' ? 'bg-amber-400' : 'bg-slate-600'}`} />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold block">Save as Draft</span>
+                          <span className="text-[10px] text-slate-400">Draft in Page studio</span>
+                        </div>
+                      </button>
+                    </div>
+
+                    {/* Schedule Date & Time Picker */}
+                    {fbState === 'SCHEDULED' && (
+                      <div className="bg-[#0B0D12] border border-fuchsia-500/40 rounded-xl p-4 shadow-inner space-y-3">
+                        <div className="flex items-center gap-2 text-fuchsia-300 text-xs font-bold">
+                          <Calendar className="h-4 w-4" />
+                          <span>Choose Scheduled Premiere Time (Facebook Reels)</span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                              Publish Date
+                            </label>
+                            <input
+                              type="date"
+                              value={fbScheduleDate}
+                              onChange={(e) => setFbScheduleDate(e.target.value)}
+                              className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-fuchsia-500 font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                              Publish Time
+                            </label>
+                            <input
+                              type="time"
+                              value={fbScheduleTime}
+                              onChange={(e) => setFbScheduleTime(e.target.value)}
+                              className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-fuchsia-500 font-mono"
+                            />
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-slate-400 font-mono">
+                          ⏰ Will publish on Facebook: <span className="text-white font-bold">{fbScheduleDate || 'Select Date'} at {fbScheduleTime || '18:00'}</span>. Must be at least 10 minutes from now.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Primary Direct Upload Button */}
+                  <div className="pt-3 border-t border-[#1F2430]">
+                    <button
+                      onClick={handlePublishFacebookDirect}
+                      disabled={fbPublishing}
+                      className="w-full bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 hover:opacity-95 text-white font-bold py-3.5 px-6 rounded-xl shadow-xl shadow-blue-950/40 flex items-center justify-center gap-2.5 text-sm transition-all disabled:opacity-50"
+                    >
+                      <Facebook className={`h-5 w-5 ${fbPublishing ? 'animate-bounce' : ''}`} />
+                      <span>
+                        {fbPublishing
+                          ? 'Publishing to Facebook Reels directly...'
+                          : fbState === 'SCHEDULED'
+                          ? `🚀 Schedule Facebook Reel (${fbScheduleDate} ${fbScheduleTime})`
+                          : fbState === 'DRAFT'
+                          ? `📝 Save Reel as Page Draft`
+                          : `🚀 Publish to Facebook Reels Directly`}
+                      </span>
+                    </button>
+                    <p className="text-[10px] text-slate-500 text-center mt-2">
+                      Uses Meta Graph API v21.0 3-step binary rupload pipeline.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Meta Credentials Setup Modal */}
+              {showFbAuthModal && (
+                <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                  <div className="bg-[#141821] border border-[#1F2430] rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+                    <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
+                      <div className="flex items-center gap-2 text-blue-400">
+                        <Facebook className="h-5 w-5" />
+                        <h3 className="text-sm font-bold text-white">Meta / Facebook Credentials Setup</h3>
+                      </div>
+                      <button onClick={() => setShowFbAuthModal(false)} className="text-slate-400 hover:text-white">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
+                      <p>
+                        To publish directly to Facebook Reels, configure your Page Access Token and Page ID in the Engine Settings:
+                      </p>
+                      <div className="space-y-2">
+                        <div>
+                          <label className="block text-[11px] font-semibold text-slate-400 mb-1">Facebook Page ID</label>
+                          <input
+                            type="text"
+                            value={fbPageId}
+                            onChange={(e) => setFbPageId(e.target.value)}
+                            placeholder="e.g. 109283746581928"
+                            className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-mono"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        You can also set these permanently in the <strong>AI Engine Settings</strong> tab or in your <code className="text-blue-300">.env</code> file.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#1F2430]">
+                      <button
+                        onClick={() => setShowFbAuthModal(false)}
+                        className="px-4 py-2 rounded-xl bg-[#0B0D12] text-slate-400 hover:text-white text-xs font-semibold"
+                      >
+                        Close
+                      </button>
+                      <button
+                        onClick={() => {
+                          setShowFbAuthModal(false);
+                          setActiveTab('settings');
+                        }}
+                        className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold"
+                      >
+                        Open Full Settings
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}

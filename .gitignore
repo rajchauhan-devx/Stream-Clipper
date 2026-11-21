@@ -31,6 +31,8 @@ workspace/temp/*
 .env
 client_secret.json
 token.json
+youtube_token.json
+workspace/jobs_db.json
 
 # OS Specific
 .DS_Store
