@@ -1,8 +1,10 @@
 import json
 import logging
 import asyncio
+import time
+import subprocess
 from typing import Dict, Any, List, Optional, Set
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +22,9 @@ from backend.schemas import (
     HardwareStatusResponse, JobProgressUpdate, JobStatus, OperatingMode,
     CropMode, CaptionStyle, LongVideoStrategy, ResetPipelineRequest, ResetPipelineResponse,
     YouTubePublishRequest, YouTubeAuthStatusResponse,
-    FacebookPublishRequest, FacebookStatusResponse
+    FacebookPublishRequest, FacebookStatusResponse,
+    ComparisonFormat, ComparisonGame, ComparisonQuest, ComparisonQuestRequest, ComparisonRenderRequest,
+    SocialMetadata, YouTubeMetadata, InstagramMetadata, FacebookMetadata
 )
 from backend.services.ingest import ingest_service
 from backend.services.gemini_director import gemini_director
@@ -276,12 +280,24 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     topic_banner_path = None
     if req.get("enable_topic_header", True):
         hook_text = clip.get("hook_text") or clip.get("hook_summary") or "GTA 6 GAMEPLAY"
+        hook_upper = hook_text.upper()
+        if any(w in hook_upper for w in ["SECRET", "MYTH", "VAULT", "CARTEL", "LOST", "MYSTERY"]):
+            cat_tag = "GTA 6 • SECRET LORE"
+        elif any(w in hook_upper for w in ["STUNT", "ESCAPE", "PURSUIT", "GETAWAY", "INSANE", "IMPOSSIBLE"]):
+            cat_tag = "GTA 6 • VIRAL MOMENT"
+        elif any(w in hook_upper for w in ["DETAIL", "MISSED", "EASTER"]):
+            cat_tag = "GTA 6 • EASTER EGG"
+        elif any(w in hook_upper for w in ["HEIST", "MISSION", "CONTRACT", "CHAPTER"]):
+            cat_tag = "GTA 6 • HEIST MISSION"
+        else:
+            cat_tag = "GTA 6 • VIRAL REEL"
+
         topic_banner_path = await asyncio.to_thread(
             video_renderer.generate_topic_banner,
             hook_text=hook_text,
             job_id=job_id,
             clip_id=clip_id,
-            category_tag="GTA 6 • NEW MISSION"
+            category_tag=cat_tag
         )
 
     final_mp4 = await asyncio.to_thread(
@@ -419,7 +435,8 @@ async def execute_job_pipeline(job_id: str):
             target_language=req.target_language.value,
             clip_count=req.clip_count,
             clip_length_range=req.clip_length_range,
-            voiceover_pacing=req.voiceover_pacing.value if hasattr(req, "voiceover_pacing") else "hook_only",
+            voiceover_pacing=req.voiceover_pacing.value if hasattr(req, "voiceover_pacing") else "full_commentary",
+            preferred_voice=getattr(req, "tts_voice", "Charon"),
             progress_callback=lambda p, m: sync_cb(p, m, JobStatus.ANALYZING)
         )
         job["plan"] = plan.model_dump()
@@ -428,14 +445,17 @@ async def execute_job_pipeline(job_id: str):
         # Step 4: Synthesize Voiceovers & Callout Graphics
         enable_overlays = getattr(req, "enable_callout_overlay", False)
         await send_progress(70, "Generating spoken hook voiceovers...", JobStatus.VOICING)
+        pacing_val = req.voiceover_pacing.value if hasattr(req, "voiceover_pacing") else "full_commentary"
         for i, clip in enumerate(job["clips"]):
             clip_id = clip["clip_id"]
+            chosen_voice = clip.get("tts_voice") or getattr(req, "tts_voice", "Charon")
             voice_path = await asyncio.to_thread(
                 gemini_director.synthesize_voiceover,
                 script=clip["commentary_script"],
                 job_id=job_id,
                 clip_id=clip_id,
-                voice_name=clip.get("tts_voice", "Puck")
+                voice_name=chosen_voice,
+                pacing=pacing_val
             )
             clip["voice_path"] = str(voice_path)
 
@@ -706,11 +726,14 @@ async def regenerate_voice(job_id: str, clip_id: str):
     if not target_clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
+    req = job.get("request") or {}
+    pacing = req.get("voiceover_pacing", "full_commentary")
     voice_path = gemini_director.synthesize_voiceover(
         script=target_clip["commentary_script"],
         job_id=job_id,
         clip_id=clip_id,
-        voice_name=target_clip.get("tts_voice", "Puck")
+        voice_name=target_clip.get("tts_voice", "Charon"),
+        pacing=pacing
     )
     target_clip["voice_path"] = str(voice_path)
     return {"status": "success", "voice_path": str(voice_path)}
@@ -934,6 +957,232 @@ async def get_export_pack(job_id: str, clip_id: str):
         "instagram": sm.get("instagram"),
         "facebook": sm.get("facebook")
     }
+
+# ------------------------------------------------------------------------------
+# Comparison Studio Endpoints (GTA 5/4 vs GTA 6)
+# ------------------------------------------------------------------------------
+
+@app.post("/api/comparison/generate-quest", response_model=ComparisonQuest)
+async def generate_comparison_quest_endpoint(payload: ComparisonQuestRequest):
+    """
+    Analyzes a GTA 6 clip using Gemini Vision and creates an actionable
+    15-second 'Mission Quest Card' for the user to record in GTA 5 or GTA 4.
+    """
+    job_id = f"quest_{int(time.time())}"
+    try:
+        # 1. Download or link GTA 6 video
+        meta = await asyncio.to_thread(
+            ingest_service.download_or_link_video,
+            url_or_path=payload.gta6_url_or_path,
+            job_id=job_id
+        )
+        raw_path = meta["raw_path"]
+
+        # 2. Cut segment for AI Vision analysis
+        cut_res = await asyncio.to_thread(
+            ingest_service.cut_video_segment,
+            raw_video_path=raw_path,
+            job_id=job_id,
+            start_time_str=payload.start_time,
+            duration_mins=max(0.5, payload.duration_sec / 60.0),
+            auto_cut_long=True
+        )
+        cut_path = cut_res["cut_path"]
+
+        # 3. Create lightweight 480p proxy
+        proxy_path = await asyncio.to_thread(
+            ingest_service.create_lightweight_proxy,
+            raw_video_path=cut_path,
+            job_id=job_id
+        )
+
+        # 4. Generate comparison quest with Gemini Vision
+        quest = await asyncio.to_thread(
+            gemini_director.analyze_gta6_and_generate_quest,
+            proxy_path=proxy_path,
+            base_game=payload.base_game.value,
+            target_language=payload.target_language.value
+        )
+        return quest
+
+    except Exception as e:
+        logger.error(f"Error generating comparison quest: {e}", exc_info=True)
+        # Return fallback quest so user is never blocked
+        return gemini_director._generate_fallback_quest(payload.base_game.value, payload.target_language.value)
+
+@app.post("/api/comparison/upload-recording")
+async def upload_comparison_recording(file: UploadFile = File(...)):
+    """Uploads the user's recorded GTA 5/4 gameplay MP4 for comparison pairing"""
+    safe_name = f"rec_{int(time.time())}_{file.filename.replace(' ', '_')}"
+    dest_path = DOWNLOADS_DIR / safe_name
+    try:
+        with open(dest_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Uploaded comparison recording to {dest_path} ({dest_path.stat().st_size / (1024*1024):.2f} MB)")
+        return {
+            "status": "success",
+            "file_path": str(dest_path),
+            "filename": file.filename,
+            "preview_url": f"/workspace/downloads/{dest_path.name}"
+        }
+    except Exception as e:
+        logger.error(f"Failed to save uploaded recording: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/comparison/render")
+async def render_comparison_endpoint(payload: ComparisonRenderRequest):
+    """
+    Renders Top/Bottom (9:16 Shorts) or Side-by-Side (16:9 Long) comparison video
+    with custom Vice City Gradient 'VS' badge and Charon commentary narration.
+    """
+    comp_id = f"comp_{int(time.time())}"
+    temp_files_to_clean = []
+
+    try:
+        # Helper to resolve input path (download if YouTube URL)
+        async def resolve_video(url_or_path: str, tag: str) -> Path:
+            if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
+                m = await asyncio.to_thread(
+                    ingest_service.download_or_link_video,
+                    url_or_path=url_or_path,
+                    job_id=f"{comp_id}_{tag}"
+                )
+                return m["raw_path"]
+            p = Path(url_or_path)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"File not found: {url_or_path}")
+            return p
+
+        # 1. Resolve both video sources
+        gta6_raw = await resolve_video(payload.gta6_url_or_path, "gta6")
+        base_raw = await resolve_video(payload.base_game_url_or_path, "base")
+
+        # 2. Trim clips according to start_time and duration
+        async def trim_clip(src_path: Path, start_str: str, dur_sec: float, tag: str) -> Path:
+            out_clip = TEMP_DIR / f"{comp_id}_{tag}_trimmed.mp4"
+            temp_files_to_clean.append(out_clip)
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", start_str,
+                "-i", str(src_path),
+                "-t", str(dur_sec),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                str(out_clip)
+            ]
+            await asyncio.to_thread(subprocess.run, cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return out_clip
+
+        gta6_dur = max(5.0, min(60.0, payload.gta6_duration_sec))
+        base_dur = max(5.0, min(60.0, payload.base_game_duration_sec))
+
+        gta6_trimmed = await trim_clip(gta6_raw, payload.gta6_start_time, gta6_dur, "gta6")
+        base_trimmed = await trim_clip(base_raw, payload.base_game_start_time, base_dur, "base")
+
+        # 3. Voiceover synthesis (Charon)
+        script = payload.commentary_script or f"How did Rockstar revolutionize game physics from {payload.base_game.value.upper()} to GTA 6? Watch closely as the physics and AI react completely differently in each game."
+        voice_path = await asyncio.to_thread(
+            gemini_director.synthesize_voiceover,
+            script=script,
+            job_id=comp_id,
+            clip_id="comp",
+            voice_name=payload.tts_voice,
+            pacing="full_commentary"
+        )
+        temp_files_to_clean.append(voice_path)
+
+        # 4. Duck base game audio under voiceover
+        mixed_audio = TEMP_DIR / f"{comp_id}_mixed.wav"
+        temp_files_to_clean.append(mixed_audio)
+        # Extract audio from base game clip
+        base_audio = TEMP_DIR / f"{comp_id}_base_audio.wav"
+        temp_files_to_clean.append(base_audio)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-i", str(base_trimmed), "-vn", "-c:a", "pcm_s16le", str(base_audio)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        await asyncio.to_thread(
+            audio_processor.duck_and_mix_audio,
+            base_audio,
+            voice_path,
+            mixed_audio,
+            -16.0,
+            1.4
+        )
+
+        # 5. Generate word-level ASS subtitles
+        ass_path = TEMP_DIR / f"{comp_id}_captions.ass"
+        temp_files_to_clean.append(ass_path)
+        await asyncio.to_thread(
+            captioner_service.generate_ass_subtitles,
+            voice_path,
+            ass_path,
+            style=payload.caption_style
+        )
+
+        # 6. Generate Top Topic Banner
+        base_tag = "GTA V" if "5" in payload.base_game.value or "v" in payload.base_game.value.lower() else "GTA IV"
+        topic_banner = await asyncio.to_thread(
+            video_renderer.generate_topic_banner,
+            hook_text=payload.hook_text,
+            job_id=comp_id,
+            clip_id="comp",
+            category_tag=f"{base_tag} VS GTA VI • COMPARISON"
+        )
+        temp_files_to_clean.append(topic_banner)
+
+        # 7. Final Compositor Render (Shorts 9:16 or Long 16:9)
+        final_mp4 = RENDERS_DIR / f"{comp_id}_comparison_{payload.format.value}.mp4"
+        await asyncio.to_thread(
+            video_renderer.render_comparison_clip,
+            base_video_path=base_trimmed,
+            gta6_video_path=gta6_trimmed,
+            mixed_audio_path=mixed_audio,
+            output_path=final_mp4,
+            comparison_format=payload.format.value,
+            base_game=payload.base_game.value,
+            ass_subtitles_path=ass_path,
+            topic_banner_path=topic_banner
+        )
+
+        return {
+            "status": "completed",
+            "comp_id": comp_id,
+            "format": payload.format.value,
+            "base_game": payload.base_game.value,
+            "hook_text": payload.hook_text,
+            "commentary_script": script,
+            "rendered_video_path": str(final_mp4),
+            "preview_url": f"/workspace/renders/{final_mp4.name}",
+            "social_metadata": {
+                "youtube": {
+                    "title": f"{payload.hook_text} 🤯 #Shorts #GTA6 #{base_tag.replace(' ', '')}",
+                    "description": f"Ultimate side-by-side comparison between {base_tag} and GTA 6! {script} #GTA6 #Gaming #Shorts",
+                    "tags": ["GTA6", base_tag.replace(' ', ''), "Gaming", "Shorts", "Comparison", "Rockstar Games"],
+                    "privacy": "public"
+                },
+                "instagram": {
+                    "caption": f"{payload.hook_text}! Which game has better physics? 🔥 Tag your squad! #gta6 #gaming #reels #rockstargames",
+                    "hashtags": ["#gta6", "#gaming", "#reels", "#rockstargames", "#gtacomparison"]
+                },
+                "facebook": {
+                    "caption": f"{payload.hook_text}! Detailed comparison breakdown.",
+                    "hashtags": ["#GTA6", "#GamingReels"]
+                }
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error rendering comparison: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for tf in temp_files_to_clean:
+            try:
+                if tf and tf.exists():
+                    tf.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------
 # Real-Time WebSocket Progress Pipeline

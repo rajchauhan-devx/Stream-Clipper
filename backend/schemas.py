@@ -100,7 +100,7 @@ class ClipBlueprint(BaseModel):
     watermark_info: WatermarkInfo = Field(default_factory=WatermarkInfo, description="AI-detected third-party watermark or creator tag info")
     caption_style: CaptionStyle = Field(default=CaptionStyle.HORMOZI_YELLOW, description="Subtitle visual preset")
     voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.HOOK_ONLY, description="Pacing: 3-6s hook only or full commentary")
-    tts_voice: str = Field(default="Puck", description="Gemini TTS voice persona")
+    tts_voice: str = Field(default="Charon", description="Gemini TTS voice persona: Charon (cinematic/storytelling male), Aoede (smooth female), Kore (calm female), Fenrir (commanding male), Puck (energetic)")
     social_metadata: SocialMetadata
     rendered_video_path: Optional[str] = Field(default=None, description="Local path to final 1080x1920 MP4")
     preview_url: Optional[str] = Field(default=None, description="Static URL to stream preview in Studio UI")
@@ -125,6 +125,7 @@ class CreateJobRequest(BaseModel):
     copyright_guard: bool = Field(default=True, description="Strip in-game GTA radio music via Demucs")
     strip_streamer_voice: bool = Field(default=True, description="Isolate and remove streamer microphone speech via Demucs")
     voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.FULL_COMMENTARY, description="Voiceover style: hook_only (3-6s) or full_commentary")
+    tts_voice: str = Field(default="Charon", description="Preferred TTS voice persona: Charon (cinematic storytelling), Aoede (smooth female), Kore (calm female), Fenrir (commanding male), Puck (energetic)")
     caption_style: CaptionStyle = Field(default=CaptionStyle.HORMOZI_YELLOW, description="Default caption style")
     enable_callout_overlay: bool = Field(default=False, description="Burn in top meme callout sticker overlay (default: False for clean gameplay)")
     enable_watermark_masker: bool = Field(default=True, description="AI-supervised watermark detection & dynamic GTA VI badge cover")
@@ -216,3 +217,49 @@ class FacebookStatusResponse(BaseModel):
     has_token: bool
     has_page_id: bool
     page_id: Optional[str] = None
+
+# ------------------------------------------------------------------------------
+# Comparison Studio Schemas
+# ------------------------------------------------------------------------------
+class ComparisonFormat(str, Enum):
+    SHORTS_SPLIT = "shorts_split"          # 9:16 Vertical (Top: Older Game, Bottom: GTA 6)
+    LONG_SIDE_BY_SIDE = "long_side_by_side" # 16:9 Landscape (Left: Older Game, Right: GTA 6)
+
+class ComparisonGame(str, Enum):
+    GTA5 = "gta5"
+    GTA4 = "gta4"
+
+class ComparisonQuest(BaseModel):
+    quest_id: str
+    test_title: str
+    gta6_summary: str
+    location: str
+    gta5_steps: List[str]
+    recommended_duration_sec: float = 15.0
+    hook_text: str
+    commentary_script: str
+    base_game: ComparisonGame = ComparisonGame.GTA5
+    social_metadata: Optional[SocialMetadata] = None
+
+class ComparisonQuestRequest(BaseModel):
+    gta6_url_or_path: str
+    base_game: ComparisonGame = ComparisonGame.GTA5
+    target_language: TargetLanguage = TargetLanguage.HINGLISH
+    start_time: str = "00:00:00"
+    duration_sec: float = 20.0
+
+class ComparisonRenderRequest(BaseModel):
+    quest_id: Optional[str] = None
+    format: ComparisonFormat = ComparisonFormat.SHORTS_SPLIT
+    base_game: ComparisonGame = ComparisonGame.GTA5
+    gta6_url_or_path: str
+    gta6_start_time: str = "00:00:00"
+    gta6_duration_sec: float = 15.0
+    base_game_url_or_path: str
+    base_game_start_time: str = "00:00:00"
+    base_game_duration_sec: float = 15.0
+    hook_text: str = "GTA 5 VS GTA 6 • PHYSICS COMPARISON"
+    commentary_script: Optional[str] = None
+    tts_voice: str = "Charon"
+    caption_style: CaptionStyle = CaptionStyle.HORMOZI_YELLOW
+

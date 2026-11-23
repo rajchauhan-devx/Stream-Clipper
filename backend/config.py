@@ -25,8 +25,8 @@ for folder in [WORKSPACE_DIR, DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR, ASSETS_DI
 # ------------------------------------------------------------------------------
 # Editable Model IDs (Centralized AI Brain Config)
 # ------------------------------------------------------------------------------
-DIRECTOR_MODEL = os.getenv("DIRECTOR_MODEL", "gemini-3.8-flash")
-TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-tts")
+DIRECTOR_MODEL = os.getenv("DIRECTOR_MODEL", "gemini-2.5-flash")
+TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-tts")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
 
 # ------------------------------------------------------------------------------
