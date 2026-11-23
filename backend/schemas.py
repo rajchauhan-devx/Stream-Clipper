@@ -123,8 +123,8 @@ class CreateJobRequest(BaseModel):
     clip_length_range: str = Field(default="30s-55s", description="Target clip length (e.g. 30s-55s)")
     clip_count: int = Field(default=3, ge=1, le=10, description="Number of viral clips to extract")
     copyright_guard: bool = Field(default=True, description="Strip in-game GTA radio music via Demucs")
-    strip_streamer_voice: bool = Field(default=False, description="Isolate and remove streamer microphone speech via Demucs")
-    voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.HOOK_ONLY, description="Voiceover style: hook_only (3-6s) or full_commentary")
+    strip_streamer_voice: bool = Field(default=True, description="Isolate and remove streamer microphone speech via Demucs")
+    voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.FULL_COMMENTARY, description="Voiceover style: hook_only (3-6s) or full_commentary")
     caption_style: CaptionStyle = Field(default=CaptionStyle.HORMOZI_YELLOW, description="Default caption style")
     enable_callout_overlay: bool = Field(default=False, description="Burn in top meme callout sticker overlay (default: False for clean gameplay)")
     enable_watermark_masker: bool = Field(default=True, description="AI-supervised watermark detection & dynamic GTA VI badge cover")
@@ -199,6 +199,11 @@ class YouTubeAuthStatusResponse(BaseModel):
     has_client_secret: bool
     client_secrets_path: str
     channel_title: Optional[str] = None
+    channel_avatar: Optional[str] = None
+    channel_handle: Optional[str] = None
+    channel_id: Optional[str] = None
+    subscriber_count: Optional[str] = None
+    auth_url: Optional[str] = None
 
 class FacebookPublishRequest(BaseModel):
     caption: Optional[str] = None

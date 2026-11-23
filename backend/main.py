@@ -11,7 +11,7 @@ from pathlib import Path
 import os
 import shutil
 from backend.config import (
-    HARDWARE, WORKSPACE_DIR, BASE_DIR, TEMP_DIR, DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR,
+    HARDWARE, WORKSPACE_DIR, BASE_DIR, TEMP_DIR, DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR, ASSETS_DIR,
     GEMINI_API_KEY, META_ACCESS_TOKEN, META_PAGE_ID, INSTAGRAM_ACCOUNT_ID,
     DIRECTOR_MODEL, TTS_MODEL, IMAGE_MODEL
 )
@@ -78,15 +78,17 @@ def load_jobs_db():
 load_jobs_db()
 
 def clean_workspace_files(job_id: str = None, delete_all: bool = True) -> int:
-    """Safely removes video downloads, proxies, demucs audio, and temp files, returning bytes freed."""
+    """Safely removes video downloads, proxies, renders, assets, and temp files, returning bytes freed."""
     freed_bytes = 0
-    target_dirs = [DOWNLOADS_DIR, PROXIES_DIR, TEMP_DIR]
+    target_dirs = [DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR, ASSETS_DIR, TEMP_DIR]
 
     for folder in target_dirs:
         if not folder.exists():
             continue
         try:
             for item in list(folder.iterdir()):
+                if item.name == ".gitkeep":
+                    continue
                 try:
                     if item.is_file():
                         if delete_all or (job_id and job_id in item.name):
@@ -97,6 +99,8 @@ def clean_workspace_files(job_id: str = None, delete_all: bool = True) -> int:
                         if delete_all or (job_id and job_id in item.name):
                             for root, dirs, files in os.walk(item, topdown=False):
                                 for f in files:
+                                    if f == ".gitkeep":
+                                        continue
                                     fp = Path(root) / f
                                     try:
                                         size = fp.stat().st_size
@@ -183,18 +187,21 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
         source_path = Path(raw_path_str or cut_path_str)
         start_time = clip_start
 
-    # 1. 9:16 Vertical Video Crop
-    if progress_callback:
-        progress_callback(f"Clip {clip_num}/{total_clips}: Cropping 9:16 vertical action framing...")
-    cropped_path = TEMP_DIR / f"{job_id}_{clip_id}_cropped.mp4"
+    # 1. Video Framing (Landscape Center Zoom)
     crop_mode = CropMode(clip.get("crop_mode") or req.get("crop_mode") or "center_zoom")
+    if progress_callback:
+        progress_callback(f"Clip {clip_num}/{total_clips}: Applying 16:9 landscape framing ({crop_mode.value})...")
+    cropped_path = TEMP_DIR / f"{job_id}_{clip_id}_cropped.mp4"
+    webcam_corner = str(clip.get("watermark_box") or "top_right")
     await asyncio.to_thread(
         video_cropper.crop_to_vertical,
         raw_video_path=source_path,
         start_time=start_time,
         duration=clip_dur,
         output_cropped_path=cropped_path,
-        mode=crop_mode
+        mode=crop_mode,
+        mask_webcam=True,
+        webcam_corner=webcam_corner
     )
 
     # 2. Extract Gameplay Audio Segment
@@ -209,10 +216,15 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
         str(seg_audio)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 3. Strip Copyright Radio or Streamer Mic Voice if enabled
-    if req.get("strip_streamer_voice", False) or (req.get("copyright_guard", True) and clip.get("has_copyrighted_music", False)):
+    # 3. Strip Copyright Radio or Streamer Mic Voice via Demucs AI
+    should_strip_voice = (
+        req.get("strip_streamer_voice", True)
+        or req.get("voiceover_pacing") == "full_commentary"
+        or (req.get("copyright_guard", True) and clip.get("has_copyrighted_music", False))
+    )
+    if should_strip_voice:
         if progress_callback:
-            progress_callback(f"Clip {clip_num}/{total_clips}: Demucs isolating SFX & removing streamer/radio audio...")
+            progress_callback(f"Clip {clip_num}/{total_clips}: Demucs isolating SFX & removing streamer/radio voice...")
         clean_audio = TEMP_DIR / f"{job_id}_{clip_id}_clean_audio.wav"
         await asyncio.to_thread(audio_processor.strip_copyright_radio, seg_audio, clean_audio)
         seg_audio = clean_audio
@@ -595,13 +607,18 @@ async def reset_pipeline(payload: Optional[ResetPipelineRequest] = None):
     # 2. Terminate any running ffmpeg or yt-dlp child processes
     try:
         import subprocess
-        subprocess.run(["pkill", "-9", "-f", "ffmpeg"], capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", "yt-dlp"], capture_output=True)
+        import sys
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", "ffmpeg.exe", "/T"], capture_output=True)
+            subprocess.run(["taskkill", "/F", "/IM", "yt-dlp.exe", "/T"], capture_output=True)
+        else:
+            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "yt-dlp"], capture_output=True)
         logger.info("Terminated active ffmpeg and yt-dlp processes.")
     except Exception as e:
         logger.warning(f"Error terminating child processes: {e}")
 
-    # 3. Clean files from downloads, proxies, and temp folders
+    # 3. Clean files from downloads, proxies, renders, assets, and temp folders
     freed_bytes = clean_workspace_files(job_id=req_job_id, delete_all=delete_all)
     freed_mb = round(freed_bytes / (1024 * 1024), 2)
 
@@ -621,8 +638,9 @@ async def reset_pipeline(payload: Optional[ResetPipelineRequest] = None):
 
     if delete_all:
         JOBS_DB.clear()
+        save_jobs_db()
 
-    msg = f"Pipeline stopped and reset. All downloads wiped, freed {freed_mb} MB disk space."
+    msg = f"Complete workspace reset successful. All downloads, proxies, renders, and assets deleted. Freed {freed_mb} MB disk space."
     logger.info(msg)
     return ResetPipelineResponse(
         status="success",
@@ -735,22 +753,73 @@ async def download_clip_endpoint(job_id: str, clip_id: str):
 
 @app.get("/api/youtube/status", response_model=YouTubeAuthStatusResponse)
 async def get_youtube_status():
-    from backend.services.publishers.youtube_pub import TOKEN_FILE
+    from backend.services.publishers.youtube_pub import youtube_publisher, TOKEN_FILE
     from backend.config import YOUTUBE_CLIENT_SECRETS_FILE
     secrets_path = Path(YOUTUBE_CLIENT_SECRETS_FILE)
+    
+    channel_info = None
+    if TOKEN_FILE.exists():
+        try:
+            channel_info = await asyncio.to_thread(youtube_publisher.get_channel_info)
+        except Exception as e:
+            logger.warning(f"Could not fetch YouTube channel info: {e}")
+
     return {
         "has_token": TOKEN_FILE.exists(),
         "has_client_secret": secrets_path.exists(),
         "client_secrets_path": str(secrets_path),
-        "channel_title": None
+        "channel_title": channel_info.get("channel_title") if channel_info else None,
+        "channel_avatar": channel_info.get("channel_avatar") if channel_info else None,
+        "channel_handle": channel_info.get("channel_handle") if channel_info else None,
+        "channel_id": channel_info.get("channel_id") if channel_info else None,
+        "subscriber_count": channel_info.get("subscriber_count") if channel_info else None,
+        "auth_url": youtube_publisher._current_auth_url if (not TOKEN_FILE.exists() and youtube_publisher._active_auth_server) else None,
     }
+
+@app.post("/api/youtube/connect")
+async def connect_youtube():
+    from backend.services.publishers.youtube_pub import youtube_publisher, TOKEN_FILE
+    if TOKEN_FILE.exists():
+        info = youtube_publisher.get_channel_info()
+        if info:
+            return {
+                "status": "connected",
+                "auth_url": None,
+                "channel_title": info.get("channel_title"),
+                "channel_avatar": info.get("channel_avatar"),
+                "channel_handle": info.get("channel_handle"),
+            }
+
+    try:
+        auth_url = await asyncio.to_thread(youtube_publisher.start_auth_flow)
+        return {
+            "status": "pending",
+            "auth_url": auth_url,
+            "message": "Auth listener started. Complete sign-in in browser."
+        }
+    except Exception as e:
+        logger.error(f"YouTube authentication failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/youtube/disconnect")
+async def disconnect_youtube():
+    from backend.services.publishers.youtube_pub import youtube_publisher
+    try:
+        res = youtube_publisher.disconnect()
+        return res
+    except Exception as e:
+        logger.error(f"YouTube disconnect failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/youtube/client-secret")
 async def save_client_secret(payload: Dict[str, Any]):
     from backend.config import YOUTUBE_CLIENT_SECRETS_FILE
+    from backend.services.publishers.youtube_pub import youtube_publisher
     secrets_path = Path(YOUTUBE_CLIENT_SECRETS_FILE)
     if "content" in payload:
         secrets_path.write_text(payload["content"], encoding="utf-8")
+        # Invalidate old token when a new secret is uploaded
+        youtube_publisher.disconnect()
         return {"status": "success", "message": f"Saved client_secret.json to {secrets_path}"}
     raise HTTPException(status_code=400, detail="Missing 'content' in payload")
 

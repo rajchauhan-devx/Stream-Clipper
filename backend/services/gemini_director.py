@@ -184,14 +184,40 @@ REQUIREMENTS:
     - "Bro did not expect this!" (5 words)
     - "They never saw this coming!" (5 words)
     STRICT REQUIREMENT: NEVER exceed 7 words! Keep it ultra-short and punchy so it finishes in 2 seconds.
-  * If 'FULL_COMMENTARY': Write continuous lively commentary reacting to the action throughout the clip duration.
+  * If 'FULL_COMMENTARY':
+    You MUST write continuous, captivating storytelling commentary in the EXACT viral "Story Lore Breakdown & Secret Explained" format (the exact style of top gaming lore reels like "How Kyle became the Red Hulk in GTA 6 Explained"):
+    - DURATION & WORD COUNT: The voiceover MUST span the full duration of the clip (target 140 to 185 words for a 40-55s clip, spoken at a smooth, confident ~200 WPM pace).
+    - EXACT 5-PART NARRATIVE STORYTELLING FORMULA:
+      1. Intriguing Hook Question (Sentence 1):
+         Open with a compelling rhetorical question that triggers intense curiosity about what's on screen.
+         Reference example: "How is this monster looking character actually a normal man in GTA 6?"
+         Other examples:
+         - "How did this simple farm mission turn into the craziest monster in GTA 6?"
+         - "Why does everyone in Vice City fear this secret hidden character?"
+         - "What actually happens if you make this dangerous secret choice in GTA 6?"
+      2. Immersive Second-Person Narrative Setup ("You"):
+         Address the viewer directly as 'you' progressing through the story:
+         - "In Chapter 2, you meet a farmer named Kyle, who asks you to help him spray chemicals on his farm using his crop duster plane."
+         - "After completing the mission, he rewards you with $400."
+      3. Escalation & Deepening Lore/Mystery:
+         - "Later, he contacts you again, asking you to bring him more chemicals. So, you deliver a van full of chemicals and discover that he's using them to grow special strawberries that boost human abilities..."
+         - "However, you can notice the terrifying side effects Kyle experiences from consuming too many..."
+      4. Climax & Shocking Reveal:
+         - "Now, in Chapter 3, you find out the police have surrounded Kyle's farm and ask you to bring him out. But when you enter the barn, you discover that Kyle has transformed into a giant monster!"
+      5. Moral Choice, Resolution & Ending:
+         - "Now you have two choices: either defeat Kyle and receive a $5,000 reward for helping the police, or help him escape."
+         - "If you choose to help him, he defeats everyone except you, gives you a hug, and jumps away like the Hulk."
+    - TONE & PACING:
+      - Crisp, articulate, curious, documentary lore storyteller.
+      - Never shout or scream; speak with calm, engaging intrigue and steady narrative momentum.
+      - Ground the story in the on-screen events and characters seen in the footage.
 - Target Clip Length: {clip_length_range} per clip.
 - Virality Score (1-100): Rate retention and hook potential.
-- Crop Mode: ALWAYS set 'crop_mode' to 'center_zoom'. 'center_zoom' centers the full 16:9 landscape gameplay in a 9:16 frame with a cinematic blurred background, keeping the action completely uncropped and zoomed out.
+- Crop Mode: ALWAYS set 'crop_mode' to 'center_zoom'. 'center_zoom' centers the full 16:9 landscape gameplay in a 9:16 frame with a cinematic blurred background, keeping the gameplay completely uncropped and in full landscape view.
 - TTS Voice: You MUST set 'tts_voice' to one of these exact names: 'Puck' (energetic male), 'Kore' (dynamic female), 'Charon' (deep cinematic male), 'Aoede' (expressive female), or 'Fenrir' (commanding male).
-- Watermark & Creator Tag Detection: Inspect video frames carefully for any persistent third-party channel names, YouTube creator watermarks, social media handles (e.g. MKIceAndFire, channel logos), or streamer webcams.
-  * If detected: set watermark_info.detected=True, watermark_info.label="<exact detected name>", and watermark_info.corner="bottom_right" | "bottom_left" | "top_right" | "top_left".
-  * If clean (no foreign watermark): set watermark_info.detected=False, watermark_info.corner="none".
+- Watermark & Streamer Webcam Detection: Inspect video frames carefully for any streamer webcam / facecam, third-party channel watermark, or logo (e.g. in top_right, top_left, bottom_right, or bottom_left).
+  * If detected: set watermark_info.detected=True, watermark_info.label="<e.g. streamer_webcam or channel_logo>", and watermark_info.corner="top_right" | "top_left" | "bottom_right" | "bottom_left".
+  * If clean (no foreign watermark or webcam): set watermark_info.detected=False, watermark_info.corner="none".
 - Copyright Music Detection: Identify if in-game radio music is playing. If detected, set has_copyrighted_music=True.
 - Social Metadata: Generate YouTube Shorts, Instagram Reels, and Facebook Reels titles, descriptions, and viral hashtags.
 """

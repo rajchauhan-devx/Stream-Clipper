@@ -23,7 +23,6 @@ import {
   Instagram,
   Facebook,
   Save,
-  Square,
   Trash2,
   Terminal,
   ChevronDown,
@@ -103,7 +102,16 @@ export default function App() {
   const [ytPublishing, setYtPublishing] = useState(false);
   const [ytPublishResult, setYtPublishResult] = useState<{ url: string; video_id: string } | null>(null);
   const [ytPublishError, setYtPublishError] = useState<string | null>(null);
-  const [ytAuthStatus, setYtAuthStatus] = useState<{ has_token: boolean; has_client_secret: boolean } | null>(null);
+  const [ytAuthStatus, setYtAuthStatus] = useState<{
+    has_token: boolean;
+    has_client_secret: boolean;
+    channel_title?: string | null;
+    channel_avatar?: string | null;
+    channel_handle?: string | null;
+    subscriber_count?: string | null;
+  } | null>(null);
+  const [ytConnecting, setYtConnecting] = useState(false);
+  const [authPopupUrl, setAuthPopupUrl] = useState<string | null>(null);
   const [showYtAuthModal, setShowYtAuthModal] = useState(false);
   const [ytSecretContent, setYtSecretContent] = useState('');
 
@@ -127,8 +135,8 @@ export default function App() {
   const [clipLength, setClipLength] = useState('30s-55s');
   const [clipCount, setClipCount] = useState(3);
   const [copyrightGuard, setCopyrightGuard] = useState(true);
-  const [stripStreamerVoice, setStripStreamerVoice] = useState(false);
-  const [voiceoverPacing, setVoiceoverPacing] = useState<'hook_only' | 'full_commentary'>('hook_only');
+  const [stripStreamerVoice, setStripStreamerVoice] = useState(true);
+  const [voiceoverPacing, setVoiceoverPacing] = useState<'hook_only' | 'full_commentary'>('full_commentary');
   const [cutStartTime, setCutStartTime] = useState('00:00:00');
   const [cutDurationMins, setCutDurationMins] = useState<number>(20);
   const [autoCutLong, setAutoCutLong] = useState(true);
@@ -334,7 +342,7 @@ export default function App() {
   const handleStopAndReset = async (skipConfirm = false) => {
     if (!skipConfirm) {
       const ok = window.confirm(
-        '🛑 Are you sure you want to STOP the pipeline?\n\nThis will immediately cancel video processing and permanently DELETE all downloaded raw videos, proxies, and temporary files from disk.'
+        '🛑 Are you sure you want to completely RESET all data?\n\nThis will permanently DELETE:\n• All downloaded raw YouTube videos\n• All generated vertical video clips\n• All voiceovers, topic banners, and proxies\n• All jobs history'
       );
       if (!ok) return;
     }
@@ -358,26 +366,32 @@ export default function App() {
 
       setActiveJobId(null);
       setProgressPct(0);
-      setProgressMsg('Pipeline stopped. All downloads wiped.');
+      setProgressMsg('All data reset. Workspace is completely clean.');
       setPipelineError(null);
       setPipelineStep('idle');
       setIsLaunching(false);
       setClips([]);
+      setSelectedClipIndex(0);
+      setUrlOrFile('');
+      setPublishUrls({});
+      setYtPublishResult(null);
+      setYtPublishError(null);
+      setJobMetadata(null);
       setActivityLogs((prev) => [
         ...prev,
         {
           timestamp: new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          message: `🛑 Pipeline stopped by user. Deleted all downloads and freed ${data.freed_mb || 0} MB disk space.`,
+          message: `🗑️ Complete reset performed: Deleted all downloaded videos, clips, and assets. Freed ${data.freed_mb || 0} MB.`,
         },
       ]);
 
       setResetBanner(
-        `✅ Pipeline halted! Deleted all downloads and freed ${data.freed_mb || 0} MB disk space.`
+        `✅ Complete reset successful! Deleted all downloaded videos, clips, and assets. Freed ${data.freed_mb || 0} MB disk space.`
       );
       setTimeout(() => setResetBanner(null), 8000);
     } catch (err) {
       console.error('Reset error:', err);
-      alert('Error resetting pipeline.');
+      alert('Error resetting data.');
     } finally {
       setIsResetting(false);
     }
@@ -572,6 +586,69 @@ export default function App() {
     window.open('https://studio.youtube.com/channel/videos/upload?d=pt', '_blank');
   };
 
+  const handleConnectYouTube = async () => {
+    setYtConnecting(true);
+    setShowYtAuthModal(true);
+    try {
+      const res = await fetch('/api/youtube/connect', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to authenticate with YouTube');
+      }
+
+      if (data.status === 'connected') {
+        await fetchYtAuthStatus();
+        setYtConnecting(false);
+        return;
+      }
+
+      if (data.auth_url) {
+        setAuthPopupUrl(data.auth_url);
+        try {
+          window.open(data.auth_url, '_blank');
+        } catch (e) {
+          console.warn('Popup blocked by browser', e);
+        }
+      }
+
+      // Start polling for token completion
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await fetch('/api/youtube/status');
+          const statusData = await statusRes.json();
+          if (statusData.has_token) {
+            clearInterval(pollInterval);
+            setYtAuthStatus(statusData);
+            setYtConnecting(false);
+            setAuthPopupUrl(null);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }, 1500);
+
+      // Stop polling after 4 minutes
+      setTimeout(() => {
+        clearInterval(pollInterval);
+        setYtConnecting(false);
+      }, 240000);
+
+    } catch (e: any) {
+      alert(`YouTube Connection Error: ${e.message}`);
+      setYtConnecting(false);
+    }
+  };
+
+  const handleDisconnectYouTube = async () => {
+    if (!confirm('Are you sure you want to disconnect this YouTube channel?')) return;
+    try {
+      await fetch('/api/youtube/disconnect', { method: 'POST' });
+      await fetchYtAuthStatus();
+    } catch (e: any) {
+      alert(`Error disconnecting: ${e.message}`);
+    }
+  };
+
   const handleSaveClientSecret = async () => {
     if (!ytSecretContent.trim()) {
       alert('Please paste the client_secret.json contents.');
@@ -585,9 +662,9 @@ export default function App() {
         body: JSON.stringify({ content: ytSecretContent }),
       });
       if (res.ok) {
-        alert('Client secret saved successfully!');
-        setShowYtAuthModal(false);
-        fetchYtAuthStatus();
+        alert('Client secret saved successfully! You can now authorize your channel.');
+        setYtSecretContent('');
+        await fetchYtAuthStatus();
       } else {
         const d = await res.json();
         alert(d.detail || 'Failed to save secret.');
@@ -833,22 +910,52 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3 text-xs">
-            {(activeJobId || pipelineStep !== 'idle' || isLaunching) && (
-              <button
-                onClick={() => handleStopAndReset(false)}
-                disabled={isResetting}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/20 border border-rose-500/40 text-rose-300 hover:bg-rose-500 hover:text-white transition-all font-semibold shadow-md shadow-rose-950/30 disabled:opacity-50"
-                title="Immediately stop pipeline and delete all downloaded video files"
-              >
-                <Square className="h-3 w-3 fill-current text-rose-400" />
-                <span>{isResetting ? 'Wiping...' : '🛑 Stop & Reset'}</span>
-              </button>
-            )}
+            <button
+              onClick={() => handleStopAndReset(false)}
+              disabled={isResetting}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-rose-300 hover:text-white transition-all font-semibold shadow-md shadow-rose-950/30 disabled:opacity-50"
+              title="Permanently delete all downloaded YouTube videos, clips, voiceovers, and jobs"
+            >
+              <Trash2 className="h-3.5 w-3.5 text-rose-400" />
+              <span>{isResetting ? 'Wiping All Data...' : '🛑 Reset All Data'}</span>
+            </button>
 
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#141821] border border-[#1F2430] text-slate-300">
               <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
               <span>{isAdc ? `🟢 Google Cloud ADC (${adcProject})` : `${directorModel} Ready`}</span>
             </div>
+
+            {ytAuthStatus?.has_token ? (
+              <div
+                onClick={() => setActiveTab('youtube')}
+                className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-[#141821] border border-red-500/40 text-slate-300 hover:text-white cursor-pointer hover:border-red-400 transition-all shadow-sm"
+                title={`Connected YouTube Channel: ${ytAuthStatus.channel_title || 'Channel'}`}
+              >
+                {ytAuthStatus.channel_avatar ? (
+                  <img
+                    src={ytAuthStatus.channel_avatar}
+                    alt="YouTube Avatar"
+                    className="h-5 w-5 rounded-full border border-red-500 object-cover"
+                  />
+                ) : (
+                  <Youtube className="h-4 w-4 text-red-500" />
+                )}
+                <span className="text-[11px] font-semibold text-slate-200 max-w-[120px] truncate">
+                  {ytAuthStatus.channel_title}
+                </span>
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              </div>
+            ) : ytAuthStatus?.has_client_secret ? (
+              <button
+                onClick={handleConnectYouTube}
+                disabled={ytConnecting}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-red-600/20 border border-red-500/40 text-red-300 hover:bg-red-600/30 text-[11px] font-semibold transition-all"
+                title="Click to sign in with Google & authorize your YouTube channel"
+              >
+                <Youtube className="h-3.5 w-3.5 text-red-400" />
+                <span>{ytConnecting ? 'Signing in...' : 'Connect YouTube'}</span>
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -958,13 +1065,13 @@ export default function App() {
                   <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl flex flex-col justify-between">
                     <div>
                       <div className="flex items-center gap-2 mb-1 text-slate-300">
-                        <Volume2 className="h-4 w-4 text-indigo-400" />
-                        <span className="text-xs font-semibold">Mute Streamer</span>
+                        <Volume2 className="h-4 w-4 text-emerald-400" />
+                        <span className="text-xs font-semibold">Remove Streamer Voice</span>
                       </div>
-                      <p className="text-[10px] text-slate-500 leading-tight">Keep OFF for walkthroughs to keep in-game character speech</p>
+                      <p className="text-[10px] text-slate-500 leading-tight">Demucs AI isolates pure game SFX & wipes streamer commentary</p>
                     </div>
                     <div className="flex items-center justify-between mt-2">
-                      <span className="text-[11px] text-slate-400">Strip Mic Speech</span>
+                      <span className="text-[11px] text-emerald-400 font-medium">Demucs AI Active</span>
                       <button
                         onClick={() => setStripStreamerVoice(!stripStreamerVoice)}
                         className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
@@ -1034,34 +1141,43 @@ export default function App() {
                 </div>
 
                 {/* Voiceover Pacing Mode */}
-                <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4 gap-3">
                   <div className="flex items-center gap-2.5">
-                    <Sparkles className="h-4 w-4 text-amber-400" />
+                    <Sparkles className="h-4 w-4 text-amber-400 shrink-0" />
                     <div>
-                      <span className="text-xs font-bold text-white">Voiceover Pacing (AI Hook Strategy)</span>
-                      <p className="text-[10px] text-slate-400">Gemini decides an attention-grabbing hook in the first 3–6s, then lets raw gameplay sound take over.</p>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-white">Voiceover Commentary & Pacing</span>
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 font-bold">
+                          REELS VIRAL ENGINE
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 mt-0.5">
+                        {voiceoverPacing === 'full_commentary'
+                          ? '🔥 Story Lore Breakdown: Curiosity hook question, step-by-step mission progression, moral choices, and twist ending.'
+                          : '⚡ 3-6s Hook Only: Speaks a quick viral hook at the start, then raw gameplay audio takes over.'}
+                      </p>
                     </div>
                   </div>
-                  <div className="flex bg-[#141821] p-1 rounded-lg border border-[#1F2430]">
-                    <button
-                      onClick={() => setVoiceoverPacing('hook_only')}
-                      className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
-                        voiceoverPacing === 'hook_only'
-                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      ⚡ 3–6s Viral Hook Only
-                    </button>
+                  <div className="flex bg-[#141821] p-1 rounded-lg border border-[#1F2430] shrink-0">
                     <button
                       onClick={() => setVoiceoverPacing('full_commentary')}
                       className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
                         voiceoverPacing === 'full_commentary'
-                          ? 'bg-indigo-600/30 text-indigo-300 border border-indigo-500/40'
+                          ? 'bg-indigo-600/40 text-indigo-200 border border-indigo-500/50 shadow-sm'
                           : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      🎙️ Full Clip Commentary
+                      🎙️ Story Breakdown (Viral Reels)
+                    </button>
+                    <button
+                      onClick={() => setVoiceoverPacing('hook_only')}
+                      className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
+                        voiceoverPacing === 'hook_only'
+                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      ⚡ 3–6s Hook Only
                     </button>
                   </div>
                 </div>
@@ -1343,17 +1459,15 @@ export default function App() {
                     <span>{isLaunching ? 'INITIALIZING PIPELINE...' : '🚀 LAUNCH PIPELINE'}</span>
                   </button>
 
-                  {(activeJobId || pipelineStep !== 'idle' || isLaunching || clips.length > 0) && (
-                    <button
-                      onClick={() => handleStopAndReset(false)}
-                      disabled={isResetting}
-                      className="w-full sm:w-auto px-5 py-3.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 hover:text-white border border-rose-500/40 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-950/40 disabled:opacity-50"
-                      title="Abort processing and delete all downloaded video files, proxies, and temporary files"
-                    >
-                      <Square className="h-4 w-4 fill-current text-rose-400" />
-                      <span>{isResetting ? 'STOPPING & WIPING...' : '🛑 STOP & RESET'}</span>
-                    </button>
-                  )}
+                  <button
+                    onClick={() => handleStopAndReset(false)}
+                    disabled={isResetting}
+                    className="w-full sm:w-auto px-5 py-3.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 hover:text-white border border-rose-500/40 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-950/40 disabled:opacity-50"
+                    title="Permanently delete all downloaded YouTube videos, clips, voiceovers, and jobs"
+                  >
+                    <Trash2 className="h-4 w-4 text-rose-400" />
+                    <span>{isResetting ? 'WIPING ALL DATA...' : '🗑️ RESET ALL DATA'}</span>
+                  </button>
                 </div>
               </div>
 
@@ -1800,14 +1914,75 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3 shrink-0">
-                  <button
-                    onClick={() => setShowYtAuthModal(true)}
-                    className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#0B0D12] border border-[#1F2430] hover:border-slate-600 text-slate-300 hover:text-white text-xs font-semibold transition-all"
-                  >
-                    <SettingsIcon className="h-3.5 w-3.5 text-slate-400" />
-                    <span>{ytAuthStatus?.has_client_secret ? '🔑 OAuth Configured' : '⚙️ Setup OAuth Secret'}</span>
-                  </button>
+                <div className="flex items-center flex-wrap gap-3 shrink-0">
+                  {ytAuthStatus?.has_token ? (
+                    <div className="flex items-center gap-3 px-3.5 py-2 rounded-2xl bg-[#0B0D12] border border-emerald-500/40 shadow-lg shadow-emerald-950/20">
+                      {ytAuthStatus.channel_avatar ? (
+                        <img
+                          src={ytAuthStatus.channel_avatar}
+                          alt={ytAuthStatus.channel_title || 'YouTube Channel'}
+                          className="h-10 w-10 rounded-full border-2 border-emerald-400 object-cover shadow-sm shrink-0"
+                        />
+                      ) : (
+                        <div className="h-10 w-10 rounded-full bg-red-600 flex items-center justify-center text-white font-bold text-xs shrink-0">
+                          <Youtube className="h-5 w-5" />
+                        </div>
+                      )}
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-bold text-white max-w-[160px] truncate">
+                            {ytAuthStatus.channel_title || 'Connected Channel'}
+                          </span>
+                          <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse shrink-0" title="Connected" />
+                        </div>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          {ytAuthStatus.channel_handle || 'Direct 1-Click Publishing Active'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 ml-1 border-l border-[#1F2430] pl-2">
+                        <button
+                          onClick={() => setShowYtAuthModal(true)}
+                          className="p-1.5 rounded-lg bg-[#141821] hover:bg-[#1E2433] text-slate-400 hover:text-white transition-colors"
+                          title="Manage OAuth & Channel"
+                        >
+                          <SettingsIcon className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={handleDisconnectYouTube}
+                          className="text-[10px] text-rose-400 hover:text-rose-300 font-medium px-1 hover:underline"
+                          title="Disconnect Channel"
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                    </div>
+                  ) : ytAuthStatus?.has_client_secret ? (
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleConnectYouTube}
+                        disabled={ytConnecting}
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-red-600 via-rose-600 to-red-700 hover:from-red-500 hover:to-rose-500 text-white text-xs font-bold shadow-lg shadow-red-950/40 transition-all disabled:opacity-50"
+                      >
+                        <Youtube className={`h-4 w-4 ${ytConnecting ? 'animate-spin' : ''}`} />
+                        <span>{ytConnecting ? 'Opening Google Auth in Browser...' : '🔴 Connect YouTube Channel'}</span>
+                      </button>
+                      <button
+                        onClick={() => setShowYtAuthModal(true)}
+                        className="p-2.5 rounded-xl bg-[#0B0D12] border border-[#1F2430] hover:border-slate-600 text-slate-300 hover:text-white text-xs transition-all"
+                        title="OAuth Secret Settings"
+                      >
+                        <SettingsIcon className="h-3.5 w-3.5 text-slate-400" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setShowYtAuthModal(true)}
+                      className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#0B0D12] border border-[#1F2430] hover:border-slate-600 text-slate-300 hover:text-white text-xs font-semibold transition-all"
+                    >
+                      <SettingsIcon className="h-3.5 w-3.5 text-slate-400" />
+                      <span>⚙️ Setup OAuth Secret</span>
+                    </button>
+                  )}
 
                   <button
                     onClick={handleOpenStudioUploader}
@@ -2224,33 +2399,137 @@ export default function App() {
               {/* YouTube OAuth Setup Modal */}
               {showYtAuthModal && (
                 <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                  <div className="bg-[#141821] border border-[#1F2430] rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+                  <div className="bg-[#141821] border border-[#1F2430] rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
                     <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
                       <div className="flex items-center gap-2 text-red-400">
                         <Youtube className="h-5 w-5" />
-                        <h3 className="text-sm font-bold text-white">YouTube Channel OAuth Setup</h3>
+                        <h3 className="text-sm font-bold text-white">YouTube Channel OAuth & Account Setup</h3>
                       </div>
                       <button onClick={() => setShowYtAuthModal(false)} className="text-slate-400 hover:text-white">
                         <X className="h-4 w-4" />
                       </button>
                     </div>
 
-                    <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
-                      <p>
-                        To enable direct 1-click publishing to your YouTube channel without leaving the app, Google requires an OAuth 2.0 Client ID:
+                    {/* Status Display: Connected Account Card */}
+                    {ytAuthStatus?.has_token ? (
+                      <div className="bg-[#0B0D12] border border-emerald-500/40 rounded-2xl p-4 flex items-center gap-4 shadow-lg shadow-emerald-950/20">
+                        {ytAuthStatus.channel_avatar ? (
+                          <img
+                            src={ytAuthStatus.channel_avatar}
+                            alt={ytAuthStatus.channel_title || 'Channel Avatar'}
+                            className="h-16 w-16 rounded-full border-2 border-emerald-400 shadow-md object-cover shrink-0"
+                          />
+                        ) : (
+                          <div className="h-16 w-16 rounded-full bg-red-600 flex items-center justify-center text-white shrink-0 font-bold text-lg">
+                            <Youtube className="h-8 w-8" />
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-bold text-white truncate">
+                              {ytAuthStatus.channel_title || 'Connected Channel'}
+                            </span>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold shrink-0">
+                              ✓ Connected
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-400 font-mono mt-0.5">
+                            {ytAuthStatus.channel_handle || 'Direct 1-Click Publishing Ready'}
+                          </p>
+                          {ytAuthStatus.subscriber_count && (
+                            <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                              {parseInt(ytAuthStatus.subscriber_count).toLocaleString()} subscribers
+                            </p>
+                          )}
+                          <p className="text-[11px] text-emerald-400/90 mt-1.5 flex items-center gap-1.5 font-medium">
+                            <Check className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                            <span>Authorized for vertical Shorts publishing</span>
+                          </p>
+                        </div>
+                      </div>
+                    ) : (ytConnecting || authPopupUrl) ? (
+                      <div className="bg-[#0B0D12] border-2 border-red-500/60 rounded-2xl p-5 space-y-3.5 shadow-xl">
+                        <div className="flex items-center gap-3 text-red-400">
+                          <Youtube className="h-6 w-6 animate-pulse shrink-0" />
+                          <div>
+                            <h4 className="text-sm font-bold text-white">Google Authorization Active</h4>
+                            <p className="text-[11px] text-slate-400">Complete the sign-in in your Google window</p>
+                          </div>
+                        </div>
+
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          A Google authorization page was launched. Choose your Google account and YouTube channel, then click <strong>Allow</strong>.
+                        </p>
+
+                        {authPopupUrl && (
+                          <a
+                            href={authPopupUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3 px-4 rounded-xl shadow-lg flex items-center justify-center gap-2 text-xs transition-all"
+                          >
+                            <ExternalLink className="h-4 w-4" />
+                            <span>👉 Click Here to Open Google Sign-In Window</span>
+                          </a>
+                        )}
+
+                        <div className="flex items-center gap-2 text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 p-2.5 rounded-xl">
+                          <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping shrink-0" />
+                          <span>Waiting for you to authorize in Google... This modal will automatically update with your YouTube profile picture as soon as you approve.</span>
+                        </div>
+
+                        <div className="text-[10px] text-slate-400 space-y-1 bg-[#141821] p-3 rounded-xl border border-[#1F2430]">
+                          <p className="font-semibold text-slate-300">💡 Important Google Screen Tips:</p>
+                          <p>• If it says <em>"Google hasn't verified this app"</em>: Click <strong>Advanced</strong> → <strong>Go to Stream-Clipper (unsafe)</strong> → <strong>Continue</strong>.</p>
+                          <p>• If it says <em>"Access blocked: This app is in testing"</em>: In Google Cloud Console, add your email to the <strong>Test users</strong> list under OAuth consent screen.</p>
+                        </div>
+                      </div>
+                    ) : ytAuthStatus?.has_client_secret ? (
+                      <div className="bg-[#0B0D12] border border-amber-500/40 rounded-2xl p-4 space-y-3">
+                        <div className="flex items-center gap-2 text-amber-300">
+                          <Check className="h-4 w-4 text-emerald-400 shrink-0" />
+                          <span className="text-xs font-bold text-white">OAuth Secret Configured (client_secret.json)</span>
+                        </div>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          Your client secrets are saved. Click below to sign in with Google in your browser to authorize your YouTube channel and load your profile icon.
+                        </p>
+                        <button
+                          onClick={handleConnectYouTube}
+                          disabled={ytConnecting}
+                          className="w-full bg-gradient-to-r from-red-600 via-rose-600 to-red-700 hover:opacity-95 text-white font-bold py-3 px-4 rounded-xl shadow-lg shadow-red-950/40 flex items-center justify-center gap-2 text-xs transition-all disabled:opacity-50"
+                        >
+                          <Youtube className="h-4 w-4" />
+                          <span>🔴 Sign In with Google & Authorize Channel</span>
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {/* Instructions and Client Secret JSON Field */}
+                    <div className="space-y-3 text-xs text-slate-300 leading-relaxed pt-2 border-t border-[#1F2430]">
+                      <p className="text-slate-400">
+                        {ytAuthStatus?.has_client_secret
+                          ? 'To switch Google Cloud projects, paste a new client_secret.json below:'
+                          : 'To enable direct 1-click publishing, Google requires an OAuth 2.0 Client ID (Desktop Application):'}
                       </p>
-                      <ol className="list-decimal list-inside space-y-1 text-slate-400 text-[11px]">
-                        <li>Go to Google Cloud Console → APIs & Services → Credentials.</li>
-                        <li>Create an <strong>OAuth 2.0 Client ID</strong> (Desktop Application).</li>
-                        <li>Download the JSON and paste its contents below (or place as <code className="text-amber-300">client_secret.json</code> in project root).</li>
-                      </ol>
+                      {!ytAuthStatus?.has_client_secret && (
+                        <ol className="list-decimal list-inside space-y-1 text-slate-400 text-[11px]">
+                          <li>Go to Google Cloud Console → APIs & Services → Credentials.</li>
+                          <li>Create an <strong>OAuth 2.0 Client ID</strong> (Desktop Application).</li>
+                          <li>Download the JSON and paste its contents below (or place as <code className="text-amber-300">client_secret.json</code> in project root).</li>
+                        </ol>
+                      )}
 
                       <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Paste client_secret.json contents:
-                        </label>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-[11px] font-semibold text-slate-300">
+                            Paste client_secret.json contents:
+                          </label>
+                          {ytAuthStatus?.has_client_secret && (
+                            <span className="text-[10px] text-emerald-400 font-mono">✓ File Present</span>
+                          )}
+                        </div>
                         <textarea
-                          rows={6}
+                          rows={4}
                           value={ytSecretContent}
                           onChange={(e) => setYtSecretContent(e.target.value)}
                           placeholder='{"installed":{"client_id":"...","project_id":"...","auth_uri":"...","token_uri":"...","client_secret":"..."}}'
@@ -2259,19 +2538,42 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#1F2430]">
-                      <button
-                        onClick={() => setShowYtAuthModal(false)}
-                        className="px-4 py-2 rounded-xl bg-[#0B0D12] text-slate-400 hover:text-white text-xs font-semibold"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={handleSaveClientSecret}
-                        className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-md shadow-red-950/30"
-                      >
-                        Save & Connect Channel
-                      </button>
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#1F2430]">
+                      {ytAuthStatus?.has_token ? (
+                        <button
+                          onClick={handleDisconnectYouTube}
+                          className="px-3.5 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 hover:bg-rose-500/20 text-xs font-semibold transition-all"
+                        >
+                          Disconnect Channel
+                        </button>
+                      ) : (
+                        <div />
+                      )}
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setShowYtAuthModal(false)}
+                          className="px-4 py-2 rounded-xl bg-[#0B0D12] text-slate-400 hover:text-white text-xs font-semibold"
+                        >
+                          Close
+                        </button>
+                        {ytSecretContent.trim() ? (
+                          <button
+                            onClick={handleSaveClientSecret}
+                            className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-md shadow-red-950/30"
+                          >
+                            Save Client Secret
+                          </button>
+                        ) : ytAuthStatus?.has_client_secret && !ytAuthStatus?.has_token ? (
+                          <button
+                            onClick={handleConnectYouTube}
+                            disabled={ytConnecting}
+                            className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-md shadow-red-950/30 disabled:opacity-50"
+                          >
+                            {ytConnecting ? 'Signing in...' : 'Sign In with Google'}
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -2800,6 +3102,50 @@ export default function App() {
                       </span>
                     </div>
 
+                    {/* YouTube Channel Connected Avatar & Status */}
+                    {ytAuthStatus?.has_token ? (
+                      <div className="flex items-center gap-2.5 p-2 rounded-xl bg-[#0B0D12] border border-emerald-500/30">
+                        {ytAuthStatus.channel_avatar ? (
+                          <img
+                            src={ytAuthStatus.channel_avatar}
+                            alt="Channel Avatar"
+                            className="h-7 w-7 rounded-full border border-emerald-400 object-cover shrink-0"
+                          />
+                        ) : (
+                          <div className="h-7 w-7 rounded-full bg-red-600 flex items-center justify-center text-white shrink-0">
+                            <Youtube className="h-3.5 w-3.5" />
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <span className="text-xs font-bold text-white truncate block">
+                            {ytAuthStatus.channel_title}
+                          </span>
+                          <span className="text-[10px] text-slate-400 font-mono truncate block">
+                            {ytAuthStatus.channel_handle || 'Connected Channel'}
+                          </span>
+                        </div>
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
+                          Ready
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between p-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300">
+                        <span>{ytAuthStatus?.has_client_secret ? 'YouTube not signed in' : 'OAuth not configured'}</span>
+                        <button
+                          onClick={() => {
+                            if (ytAuthStatus?.has_client_secret) {
+                              handleConnectYouTube();
+                            } else {
+                              setShowYtAuthModal(true);
+                            }
+                          }}
+                          className="text-[10px] font-bold bg-amber-500 text-black px-2 py-0.5 rounded hover:bg-amber-400"
+                        >
+                          {ytAuthStatus?.has_client_secret ? 'Sign In' : 'Setup'}
+                        </button>
+                      </div>
+                    )}
+
                     <div>
                       <div className="flex justify-between text-[11px] text-slate-400 mb-1">
                         <span>Shorts Title</span>
@@ -3144,6 +3490,37 @@ export default function App() {
                     <p>Whisper Engine: <span className="text-indigo-400">{hardware?.whisper_backend}</span></p>
                   </div>
                 </div>
+              </div>
+
+              {/* Complete Reset & Storage Clean Card */}
+              <div className="bg-[#141821] border border-rose-500/30 rounded-2xl p-6 shadow-xl space-y-4">
+                <div className="flex items-center gap-2.5 text-rose-400">
+                  <Trash2 className="h-5 w-5" />
+                  <div>
+                    <h2 className="text-base font-bold text-white">Complete Workspace Reset & Disk Cleanup</h2>
+                    <p className="text-xs text-slate-400">Permanently delete all downloaded YouTube videos, clips, and generated assets.</p>
+                  </div>
+                </div>
+
+                <div className="bg-[#0B0D12] rounded-xl border border-[#1F2430] p-4 text-xs space-y-2 text-slate-300">
+                  <p className="font-semibold text-rose-300">This action will permanently delete:</p>
+                  <ul className="list-disc list-inside space-y-1 text-slate-400 text-[11px]">
+                    <li><strong>Downloaded Raw Videos</strong>: All raw YouTube VODs & gameplay in <code className="text-amber-300">workspace/downloads/</code></li>
+                    <li><strong>Rendered Shorts Clips</strong>: All final 1080x1920 video clips in <code className="text-amber-300">workspace/renders/</code></li>
+                    <li><strong>AI Assets</strong>: All generated voiceovers (.wav), topic banners, and badge overlays in <code className="text-amber-300">workspace/assets/</code></li>
+                    <li><strong>Proxies & Temp Files</strong>: All 480p proxies and segment cuts in <code className="text-amber-300">workspace/proxies/</code> and <code className="text-amber-300">workspace/temp/</code></li>
+                    <li><strong>Jobs History</strong>: Clears the entire jobs database in <code className="text-amber-300">workspace/jobs_db.json</code></li>
+                  </ul>
+                </div>
+
+                <button
+                  onClick={() => handleStopAndReset(false)}
+                  disabled={isResetting}
+                  className="w-full py-3.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-950/40 disabled:opacity-50"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  <span>{isResetting ? 'Deleting All Data & Wiping Workspace...' : '🗑️ Complete Factory Reset: Delete All Downloaded Videos & Clips'}</span>
+                </button>
               </div>
             </div>
           )}

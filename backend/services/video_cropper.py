@@ -25,6 +25,15 @@ class VideoCropper:
             self._yolo_model = YOLO("yolo11n.pt")
         return self._yolo_model
 
+    def _get_video_metadata(self, video_path: Path) -> dict:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return {"width": 1920, "height": 1080}
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return {"width": w if w > 0 else 1920, "height": h if h > 0 else 1080}
+
     def calculate_action_track_x(
         self,
         video_segment_path: Path,
@@ -59,10 +68,15 @@ class VideoCropper:
                 if frame_idx % sample_interval == 0:
                     results = model(frame, classes=action_classes, verbose=False)
                     if results and len(results[0].boxes) > 0:
-                        # Find highest confidence or largest action box
                         boxes = results[0].boxes.xywh.cpu().numpy()
+                        # Exclude corner streamer webcams from gameplay centering
+                        gameplay_boxes = [
+                            b for b in boxes
+                            if not ((b[0] > 0.72 * width or b[0] < 0.28 * width) and (b[1] < 0.35 * height or b[1] > 0.65 * height))
+                        ]
+                        target_boxes = gameplay_boxes if gameplay_boxes else boxes
                         # Sort by area (w * h)
-                        largest_box = max(boxes, key=lambda b: b[2] * b[3])
+                        largest_box = max(target_boxes, key=lambda b: b[2] * b[3])
                         centers.append(float(largest_box[0]))
                     else:
                         centers.append(width / 2.0)
@@ -84,7 +98,7 @@ class VideoCropper:
 
         # Calculate median of detected centers for stable framing
         median_center = float(np.median(centers))
-        # Center the 608px crop window on the action center
+        # Center the crop window on the action center
         crop_x = int(median_center - (crop_w / 2))
         # Clamp within valid bounds [0, max_x]
         return max(0, min(crop_x, max_x))
@@ -96,13 +110,15 @@ class VideoCropper:
         duration: float,
         output_cropped_path: Path,
         mode: CropMode = CropMode.ACTION_TRACK,
+        mask_webcam: bool = True,
+        webcam_corner: str = "top_right",
         progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> Path:
         """
         Converts 16:9 gameplay to 1080x1920 (9:16) vertical using:
-        - action_track: YOLO-guided panning
+        - action_track: YOLO-guided panning that isolates gameplay and completely crops out streamer webcams
         - facecam_split: Top 35% streamer facecam / Bottom 65% gameplay
-        - center_zoom: Cinematic center crop with blurred background fill
+        - center_zoom: Cinematic center crop with blurred background fill & frosted webcam concealment
         """
         if progress_callback:
             progress_callback(30, f"Applying 9:16 vertical crop ({mode.value})...")
@@ -112,6 +128,13 @@ class VideoCropper:
         # Codec arguments based on hardware
         codec = HARDWARE.ffmpeg_codec
         encoder_args = HARDWARE.encoder_args
+
+        # Get exact source dimensions
+        meta = self._get_video_metadata(raw_video_path)
+        v_width = meta.get("width", 1920)
+        v_height = meta.get("height", 1080)
+
+        filter_args = []
 
         if mode == CropMode.ACTION_TRACK:
             # Extract temporary segment to sample with YOLO
@@ -128,32 +151,60 @@ class VideoCropper:
             crop_x = self.calculate_action_track_x(temp_segment)
             temp_segment.unlink(missing_ok=True)
 
-            # Crop width 608 (9/16 of 1080), height 1080, then scale to 1080x1920
-            vf = f"crop=608:1080:{crop_x}:0,scale=1080:1920,setsar=1"
+            # Dynamic 9:16 crop calculation based on actual video dimensions
+            crop_w = int(v_height * (9 / 16))
+            crop_w = crop_w - (crop_w % 2)
+            crop_x = max(0, min(crop_x, v_width - crop_w))
+            crop_x = crop_x - (crop_x % 2)
+
+            vf = f"crop={crop_w}:{v_height}:{crop_x}:0,scale=1080:1920:flags=lanczos,setsar=1"
+            filter_args = ["-vf", vf]
 
         elif mode == CropMode.FACECAM_SPLIT:
             # Top 35% (672px): Top-left facecam. Bottom 65% (1248px): centered gameplay
+            crop_top_w = int(v_width * 0.35)
+            crop_top_h = int(v_height * 0.45)
+            crop_bot_w = int(v_height * (9 / 16))
+            bot_x = int((v_width - crop_bot_w) / 2)
             vf = (
-                "[0:v]crop=640:480:20:20,scale=1080:672[top];"
-                "[0:v]crop=608:1080:656:0,scale=1080:1248[bottom];"
-                "[top][bottom]vstack,setsar=1"
+                f"[0:v]crop={crop_top_w}:{crop_top_h}:20:20,scale=1080:672[top];"
+                f"[0:v]crop={crop_bot_w}:{v_height}:{bot_x}:0,scale=1080:1248[bottom];"
+                "[top][bottom]vstack,setsar=1[v_out]"
             )
+            filter_args = ["-filter_complex", vf, "-map", "[v_out]"]
 
         else:  # CENTER_ZOOM (Landscape Centered in 9:16 with Blurred Background Fill)
-            # High-end cinematic blurred background + centered pristine uncropped 16:9 foreground
-            # The full 16:9 gameplay is completely zoomed out, uncropped, with in-game subtitles intact
-            vf = (
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:5[bg];"
-                "[0:v]scale=1080:608:flags=lanczos[fg];"
-                "[bg][fg]overlay=0:656,setsar=1"
-            )
+            if mask_webcam:
+                # Top-right webcam: X=750..1070, Y=660..890 on 1080x1920 canvas
+                if "left" in webcam_corner.lower():
+                    cam_x, cam_y, cam_w, cam_h = 10, 660, 320, 230
+                elif "bottom" in webcam_corner.lower():
+                    cam_x, cam_y, cam_w, cam_h = 750, 1030, 320, 230
+                else:  # top_right
+                    cam_x, cam_y, cam_w, cam_h = 750, 660, 320, 230
+
+                vf = (
+                    "[0:v]scale=1080:1920:flags=bicubic,boxblur=30:5[bg];"
+                    "[0:v]scale=1080:608:flags=lanczos[fg];"
+                    "[bg][fg]overlay=0:656,split=2[v_base][v_for_crop];"
+                    f"[v_for_crop]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},boxblur=30:5[cam_blur];"
+                    f"[v_base][cam_blur]overlay={cam_x}:{cam_y},setsar=1[v_clean]"
+                )
+                filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
+            else:
+                vf = (
+                    "[0:v]scale=1080:1920:flags=bicubic,boxblur=30:5[bg];"
+                    "[0:v]scale=1080:608:flags=lanczos[fg];"
+                    "[bg][fg]overlay=0:656,setsar=1[v_clean]"
+                )
+                filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
 
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start_time),
             "-t", str(duration),
             "-i", str(raw_video_path),
-            "-filter_complex" if (mode != CropMode.ACTION_TRACK) else "-vf", vf,
+            *filter_args,
             "-c:v", codec,
             *encoder_args,
             "-an",  # Audio will be handled by audio_processor and renderer

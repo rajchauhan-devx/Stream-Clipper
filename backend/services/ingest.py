@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 import yt_dlp
 
-from backend.config import DOWNLOADS_DIR, PROXIES_DIR, TEMP_DIR
+from backend.config import BASE_DIR, WORKSPACE_DIR, DOWNLOADS_DIR, PROXIES_DIR, TEMP_DIR
 
 logger = logging.getLogger("gta6-studio.ingest")
 
@@ -167,19 +167,58 @@ class IngestService:
                 if progress_callback:
                     progress_callback(30, "1080p stream downloaded. Merging video & audio tracks...")
 
+        # Check for cookies file if provided
+        cookie_file = None
+        for candidate in [
+            BASE_DIR / "cookies.txt",
+            WORKSPACE_DIR / "cookies.txt",
+            Path.cwd() / "cookies.txt",
+        ]:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                cookie_file = str(candidate.resolve())
+                break
+
         ydl_opts = {
-            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             'outtmpl': str(self.downloads_dir / f"{job_id}_raw.%(ext)s"),
             'merge_output_format': 'mp4',
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [ytdl_hook],
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv', 'visionos', 'android', 'web']
+                }
+            },
+            'js_runtimes': {'node': {}}
         }
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"Using cookies file for yt-dlp: {cookie_file}")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url_or_path, download=True)
-            title = info.get('title', f"GTA6_Gameplay_{job_id}")
-            duration = float(info.get('duration', 0.0))
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url_or_path, download=True)
+                title = info.get('title', f"GTA6_Gameplay_{job_id}")
+                duration = float(info.get('duration', 0.0))
+        except Exception as e:
+            err_msg = str(e)
+            if "Sign in to confirm you’re not a bot" in err_msg or "bot" in err_msg.lower() or "429" in err_msg:
+                logger.warning(f"YouTube bot detection caught: {e}. Retrying with VisionOS & Android client...")
+                if progress_callback:
+                    progress_callback(10, "Bypassing YouTube bot challenge via VisionOS/Android client...")
+                fallback_opts = dict(ydl_opts)
+                fallback_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['visionos', 'android']
+                    }
+                }
+                with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
+                    info = fallback_ydl.extract_info(url_or_path, download=True)
+                    title = info.get('title', f"GTA6_Gameplay_{job_id}")
+                    duration = float(info.get('duration', 0.0))
+            else:
+                raise
 
         # Check expected file
         if not output_raw_path.exists():

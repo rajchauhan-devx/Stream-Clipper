@@ -34,9 +34,11 @@ class AudioProcessor:
         demucs_out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            device = "cuda" if (torch.cuda.is_available() and getattr(HARDWARE, "is_cuda", False)) else "cpu"
             # Run demucs command-line tool with two-stems=vocals or htdemucs
             cmd = [
                 sys.executable, "-m", "demucs",
+                "-d", device,
                 "--two-stems", "vocals",
                 "-n", "htdemucs",
                 "--out", str(demucs_out_dir),
@@ -48,14 +50,25 @@ class AudioProcessor:
             track_name = audio_segment_path.stem
             isolated_no_vocals = demucs_out_dir / "htdemucs" / track_name / "no_vocals.wav"
 
-            if isolated_no_vocals.exists():
+            if isolated_no_vocals.exists() and isolated_no_vocals.stat().st_size > 1000:
                 shutil.copy2(isolated_no_vocals, output_clean_path)
+                logger.info(f"Demucs voice separation successful: {output_clean_path}")
             else:
-                shutil.copy2(audio_segment_path, output_clean_path)
+                logger.warning("Demucs no_vocals file missing or empty. Using attenuated fallback.")
+                # Attenuate audio so streamer voice is muffled
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(audio_segment_path),
+                    "-af", "volume=0.35,lowpass=f=2500",
+                    str(output_clean_path)
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         except Exception as e:
-            logger.warning(f"Demucs separation encountered issue ({e}). Fallback to standard audio.")
-            shutil.copy2(audio_segment_path, output_clean_path)
+            logger.warning(f"Demucs separation encountered issue ({e}). Fallback to muffled audio.")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(audio_segment_path),
+                "-af", "volume=0.35,lowpass=f=2500",
+                str(output_clean_path)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         finally:
             # Strict VRAM and unified memory cleanup
