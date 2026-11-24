@@ -395,9 +395,11 @@ class IngestService:
             if win_blocks >= len(energies):
                 return 0.0
 
-            best_idx = 0
+            # Skip initial 40s on long videos (>180s) to prevent locking onto loud streamer intro greetings
+            start_block = 4 if (len(energies) > 18 and total_duration > 180.0) else 0
+            best_idx = start_block
             best_avg = 0.0
-            for i in range(len(energies) - win_blocks + 1):
+            for i in range(start_block, len(energies) - win_blocks + 1):
                 avg = float(np.mean(energies[i : i + win_blocks]))
                 if avg > best_avg:
                     best_avg = avg

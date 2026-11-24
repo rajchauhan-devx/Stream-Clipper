@@ -69,12 +69,24 @@ interface SocialMetadata {
   };
 }
 
+interface StoryBeat {
+  beat_id: string;
+  label: string;
+  start_time: number;
+  duration: number;
+  description?: string;
+}
+
 interface Clip {
   clip_id: string;
+  clip_type?: 'story_montage' | 'single_moment';
   start_time: number;
   end_time: number;
   duration: number;
+  beats?: StoryBeat[];
   virality_score: number;
+  reviewer_score?: number;
+  reviewer_verdict?: string;
   hook_text: string;
   hook_summary: string;
   commentary_script: string;
@@ -164,6 +176,7 @@ export default function App() {
   const [voiceoverPacing, setVoiceoverPacing] = useState<'hook_only' | 'full_commentary'>('full_commentary');
   const [selectedVoice, setSelectedVoice] = useState('Charon');
   const [isRevoicing, setIsRevoicing] = useState(false);
+  const [isRenderingClip, setIsRenderingClip] = useState(false);
   const [cutStartTime, setCutStartTime] = useState('00:00:00');
   const [cutDurationMins, setCutDurationMins] = useState<number>(20);
   const [autoCutLong, setAutoCutLong] = useState(true);
@@ -256,7 +269,7 @@ export default function App() {
       .catch((err) => console.warn('Could not restore latest job:', err));
   }, []);
 
-  const handleLaunch = async () => {
+  const handleLaunch = async (selectedMode: 'manual_studio' | 'auto_pilot' = 'manual_studio') => {
     if (!urlOrFile) {
       alert('Please enter a YouTube link or file path to raw gameplay.');
       return;
@@ -264,12 +277,12 @@ export default function App() {
     setIsLaunching(true);
     setPipelineError(null);
     setProgressPct(5);
-    setProgressMsg('Registering job pipeline...');
+    setProgressMsg(selectedMode === 'manual_studio' ? 'Scanning video to extract all real missions...' : 'Initializing autonomous batch pipeline...');
     setPipelineStep('ingesting');
     const initialTime = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     setActivityLogs([{
       timestamp: initialTime,
-      message: '🚀 Initializing job pipeline on local M4 engine...'
+      message: `🚀 Launching ${selectedMode === 'manual_studio' ? 'Topic Discovery (Review & Select First)' : 'Full Auto-Pilot'} on local engine...`
     }]);
 
     try {
@@ -278,7 +291,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url_or_path: urlOrFile,
-          mode: 'auto_pilot',
+          mode: selectedMode,
           target_language: language,
           clip_length_range: clipLength,
           clip_count: clipCount,
@@ -332,6 +345,8 @@ export default function App() {
                 setActiveTab('studio');
               }
             }
+          } else if (msg.event === 'clip_rendering') {
+            setIsRenderingClip(true);
           } else if (msg.event === 'clip_rendered') {
             setClips((prev) =>
               prev.map((c) =>
@@ -340,6 +355,7 @@ export default function App() {
                   : c
               )
             );
+            setIsRenderingClip(false);
           } else if (msg.event === 'job_cancelled') {
             setActiveJobId(null);
             setProgressPct(0);
@@ -440,6 +456,32 @@ export default function App() {
       });
     } catch (e) {
       console.warn('Could not sync clip update:', e);
+    }
+  };
+
+  const handleRenderSelectedClip = async () => {
+    if (!activeJobId || !activeClip) return;
+    setIsRenderingClip(true);
+    try {
+      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          commentary_script: activeClip.commentary_script,
+          hook_text: activeClip.hook_text,
+          crop_mode: activeClip.crop_mode,
+          caption_style: activeClip.caption_style,
+          tts_voice: activeClip.tts_voice || 'Charon',
+        }),
+      });
+      const res = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/render`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error('Render request failed');
+    } catch (err: any) {
+      console.error('Failed to render clip:', err);
+      alert(`Render error: ${err.message}`);
+      setIsRenderingClip(false);
     }
   };
 
@@ -1636,12 +1678,22 @@ export default function App() {
                 {/* Launch & Stop Action Buttons */}
                 <div className="mt-6 flex flex-col sm:flex-row items-center gap-3">
                   <button
-                    onClick={handleLaunch}
+                    onClick={() => handleLaunch('manual_studio')}
                     disabled={isLaunching || isResetting}
-                    className="flex-1 w-full bg-gradient-to-r from-indigo-600 via-indigo-500 to-emerald-500 hover:opacity-95 text-white font-bold py-3.5 px-6 rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                    className="flex-1 w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:opacity-95 text-white font-extrabold py-3.5 px-6 rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
                   >
-                    <PlayCircle className="h-5 w-5" />
-                    <span>{isLaunching ? 'INITIALIZING PIPELINE...' : '🚀 LAUNCH PIPELINE'}</span>
+                    <Sparkles className="h-5 w-5 text-amber-300" />
+                    <span>{isLaunching ? 'EXTRACTING REAL TOPICS...' : '🔍 SCAN & EXTRACT REAL TOPICS (REVIEW FIRST)'}</span>
+                  </button>
+
+                  <button
+                    onClick={() => handleLaunch('auto_pilot')}
+                    disabled={isLaunching || isResetting}
+                    className="w-full sm:w-auto px-5 py-3.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 hover:text-white border border-emerald-500/40 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-950/40 disabled:opacity-50"
+                    title="Scan video and immediately render all extracted viral shorts"
+                  >
+                    <PlayCircle className="h-4 w-4 text-emerald-400" />
+                    <span>⚡ AUTO-PILOT (RENDER ALL)</span>
                   </button>
 
                   <button
@@ -1651,7 +1703,7 @@ export default function App() {
                     title="Permanently delete all downloaded YouTube videos, clips, voiceovers, and jobs"
                   >
                     <Trash2 className="h-4 w-4 text-rose-400" />
-                    <span>{isResetting ? 'WIPING ALL DATA...' : '🗑️ RESET ALL DATA'}</span>
+                    <span>{isResetting ? 'WIPING...' : '🗑️ RESET ALL'}</span>
                   </button>
                 </div>
               </div>
@@ -1855,13 +1907,24 @@ export default function App() {
                     }`}
                   >
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-xs font-bold text-white uppercase tracking-tight">
-                        Clip #{idx + 1} ({clip.duration}s)
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-bold text-white uppercase tracking-tight">
+                          Clip #{idx + 1} ({clip.duration}s)
+                        </span>
+                        {clip.beats && clip.beats.length > 1 ? (
+                          <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold">
+                            🎬 {clip.beats.length} BEATS
+                          </span>
+                        ) : (
+                          <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold">
+                            ⚡ CLIMAX
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-1 bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 rounded-full">
                         <TrendingUp className="h-3 w-3 text-emerald-400" />
                         <span className="text-[10px] font-bold text-emerald-400 font-mono">
-                          {clip.virality_score}/100
+                          {clip.reviewer_score || clip.virality_score}/100
                         </span>
                       </div>
                     </div>
@@ -1979,11 +2042,57 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Senior Reviewer Quality Card */}
+                  <div className="bg-[#0B0D12] rounded-xl p-3 border border-indigo-500/30 bg-gradient-to-r from-indigo-950/20 to-purple-950/20 space-y-2">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
+                      <div className="flex items-center gap-1.5">
+                        <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+                        <span className="text-indigo-300 font-bold">Senior Reviewer & Quality Gate</span>
+                      </div>
+                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
+                        ⭐ Rating: {activeClip.reviewer_score || activeClip.virality_score}/100
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 leading-relaxed font-mono">
+                      {activeClip.reviewer_verdict || activeClip.hook_summary}
+                    </p>
+                  </div>
+
+                  {/* Story Beats Montage Breakdown */}
+                  {activeClip.beats && activeClip.beats.length > 0 && (
+                    <div className="bg-[#0B0D12] rounded-xl p-3 border border-purple-500/30 space-y-2">
+                      <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
+                        <div className="flex items-center gap-1.5">
+                          <Layers className="h-3.5 w-3.5 text-purple-400" />
+                          <span className="text-white font-bold">Story Arc Montage ({activeClip.beats.length} Beats)</span>
+                        </div>
+                        <span className="text-[10px] text-purple-300 font-mono">
+                          {activeClip.duration}s total
+                        </span>
+                      </div>
+                      <div className="space-y-1.5 pt-1">
+                        {activeClip.beats.map((beat, bIdx) => (
+                          <div key={bIdx} className="bg-[#141821] border border-[#1F2430] rounded-lg p-2 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-slate-200 truncate">{beat.label}</p>
+                              {beat.description && (
+                                <p className="text-[10px] text-slate-400 truncate">{beat.description}</p>
+                              )}
+                            </div>
+                            <span className="text-[10px] font-mono text-cyan-300 bg-cyan-950/40 border border-cyan-800/40 px-1.5 py-0.5 rounded shrink-0">
+                              {beat.duration}s
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* AI Virality Analysis */}
                   <div className="bg-[#0B0D12] rounded-xl p-3 border border-[#1F2430]">
                     <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 mb-1">
-                      <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-                      <span>Gemini Hook & Virality Analysis</span>
+                      <TrendingUp className="h-3.5 w-3.5 text-emerald-400" />
+                      <span>Gemini Viral Hook Analysis</span>
                     </div>
                     <p className="text-xs text-slate-400 leading-relaxed">
                       {activeClip.hook_summary}
@@ -2062,9 +2171,23 @@ export default function App() {
                         <span>📥 Download 1080x1920 Short (MP4)</span>
                       </a>
                     ) : (
-                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-center">
-                        <p className="text-xs text-amber-300 font-semibold">⏳ In autonomous render queue...</p>
-                      </div>
+                      <button
+                        onClick={handleRenderSelectedClip}
+                        disabled={isRenderingClip}
+                        className="w-full bg-gradient-to-r from-amber-500 via-orange-500 to-pink-500 hover:opacity-95 text-black font-extrabold py-3.5 px-4 rounded-xl shadow-lg shadow-amber-500/30 flex items-center justify-center gap-2 text-xs transition-all disabled:opacity-50"
+                      >
+                        {isRenderingClip ? (
+                          <>
+                            <Loader2 className="h-4 w-4 animate-spin text-black" />
+                            <span>⚡ RENDERING 9:16 SHORT ({activeClip.duration}s)...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Zap className="h-4 w-4 text-black" />
+                            <span>⚡ RENDER THIS MISSION SHORT ({activeClip.duration}s)</span>
+                          </>
+                        )}
+                      </button>
                     )}
 
                     <button

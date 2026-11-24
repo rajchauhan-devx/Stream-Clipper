@@ -103,6 +103,82 @@ class VideoCropper:
         # Clamp within valid bounds [0, max_x]
         return max(0, min(crop_x, max_x))
 
+    def detect_streamer_fullscreen_intro(
+        self,
+        video_path: Path,
+        max_scan_sec: float = 120.0,
+        sample_interval_sec: float = 2.0
+    ) -> float:
+        """
+        Scans opening minutes of video using YOLO to detect if streamer is
+        occupying full screen (talking head/intro) instead of playing game.
+        Returns the timestamp (seconds) where pure gameplay begins.
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return 0.0
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        total_duration = total_frames / fps if fps > 0 else 0.0
+
+        scan_duration = min(total_duration, max_scan_sec)
+        if scan_duration < 10.0:
+            cap.release()
+            return 0.0
+
+        intro_end_sec = 0.0
+        step_frames = max(1, int(fps * sample_interval_sec))
+
+        try:
+            model = self._get_yolo()
+            current_frame = 0
+            max_frame = int(scan_duration * fps)
+
+            while current_frame < max_frame:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                results = model(frame, classes=[0], verbose=False)
+                has_fullscreen_human = False
+
+                if results and len(results[0].boxes) > 0:
+                    boxes = results[0].boxes.xywh.cpu().numpy()
+                    for b in boxes:
+                        box_w, box_h = b[2], b[3]
+                        box_area = (box_w * box_h) / (width * height)
+                        # Fullscreen streamer check: large person taking >20% of frame area,
+                        # >30% width, >40% height, and positioned centrally
+                        if box_area > 0.20 and box_w > (0.30 * width) and box_h > (0.40 * height):
+                            has_fullscreen_human = True
+                            break
+
+                sec = current_frame / fps
+                if has_fullscreen_human:
+                    intro_end_sec = sec + sample_interval_sec
+                elif intro_end_sec > 0 and (sec - intro_end_sec) > 6.0:
+                    # Gameplay confirmed for several consecutive checks
+                    break
+
+                current_frame += step_frames
+
+        except Exception as e:
+            logger.warning(f"Error checking streamer intro: {e}")
+        finally:
+            cap.release()
+            if HARDWARE.is_cuda:
+                import torch
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        if intro_end_sec > 0:
+            logger.info(f"YOLO detected full-screen streamer intro ending at {intro_end_sec:.1f}s.")
+        return intro_end_sec
+
     def crop_to_vertical(
         self,
         raw_video_path: Path,

@@ -191,34 +191,109 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
         source_path = Path(raw_path_str or cut_path_str)
         start_time = clip_start
 
-    # 1. Video Framing (Landscape Center Zoom)
+    # 1. Video & Audio Framing (Multi-Beat Story Montage or Single Continuous Moment)
     crop_mode = CropMode(clip.get("crop_mode") or req.get("crop_mode") or "center_zoom")
-    if progress_callback:
-        progress_callback(f"Clip {clip_num}/{total_clips}: Applying 16:9 landscape framing ({crop_mode.value})...")
     cropped_path = TEMP_DIR / f"{job_id}_{clip_id}_cropped.mp4"
-    webcam_corner = str(clip.get("watermark_box") or "top_right")
-    await asyncio.to_thread(
-        video_cropper.crop_to_vertical,
-        raw_video_path=source_path,
-        start_time=start_time,
-        duration=clip_dur,
-        output_cropped_path=cropped_path,
-        mode=crop_mode,
-        mask_webcam=True,
-        webcam_corner=webcam_corner
-    )
-
-    # 2. Extract Gameplay Audio Segment
     seg_audio = TEMP_DIR / f"{job_id}_{clip_id}_gameplay_raw.wav"
-    import subprocess
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-ss", str(start_time),
-        "-t", str(clip_dur),
-        "-i", str(source_path),
-        "-vn", "-c:a", "pcm_s16le", "-ar", "48000",
-        str(seg_audio)
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    webcam_corner = str(clip.get("watermark_box") or "top_right")
+
+    beats_list = clip.get("beats") or []
+    if len(beats_list) > 1:
+        # Multi-Beat Story Montage Pipeline
+        if progress_callback:
+            progress_callback(f"Clip {clip_num}/{total_clips}: Assembling {len(beats_list)}-beat story montage ({crop_mode.value})...")
+        logger.info(f"Assembling multi-beat story montage for {clip_id} with {len(beats_list)} beats...")
+
+        beat_v_paths = []
+        beat_a_paths = []
+        import subprocess
+
+        for b_idx, beat in enumerate(beats_list):
+            b_start = float(beat.get("start_time", 0.0))
+            b_dur = float(beat.get("duration", 8.0))
+            if raw_path and raw_path.exists():
+                act_start = cut_start_sec + b_start
+            else:
+                act_start = b_start
+
+            b_cropped = TEMP_DIR / f"{job_id}_{clip_id}_beat_{b_idx}_cropped.mp4"
+            b_audio = TEMP_DIR / f"{job_id}_{clip_id}_beat_{b_idx}_audio.wav"
+
+            await asyncio.to_thread(
+                video_cropper.crop_to_vertical,
+                raw_video_path=source_path,
+                start_time=act_start,
+                duration=b_dur,
+                output_cropped_path=b_cropped,
+                mode=crop_mode,
+                mask_webcam=True,
+                webcam_corner=webcam_corner
+            )
+            beat_v_paths.append(b_cropped)
+
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-ss", str(act_start),
+                "-t", str(b_dur),
+                "-i", str(source_path),
+                "-vn", "-c:a", "pcm_s16le", "-ar", "48000",
+                str(b_audio)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            beat_a_paths.append(b_audio)
+
+        # Concat video beats
+        v_list_file = TEMP_DIR / f"{job_id}_{clip_id}_v_concat.txt"
+        v_list_file.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in beat_v_paths), encoding="utf-8")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(v_list_file),
+            "-c", "copy",
+            str(cropped_path)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Concat audio beats
+        a_list_file = TEMP_DIR / f"{job_id}_{clip_id}_a_concat.txt"
+        a_list_file.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in beat_a_paths), encoding="utf-8")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(a_list_file),
+            "-c:a", "pcm_s16le", "-ar", "48000",
+            str(seg_audio)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Cleanup intermediate beat files
+        v_list_file.unlink(missing_ok=True)
+        a_list_file.unlink(missing_ok=True)
+        for p in beat_v_paths:
+            p.unlink(missing_ok=True)
+        for p in beat_a_paths:
+            p.unlink(missing_ok=True)
+
+    else:
+        # Standard Single Continuous Moment
+        if progress_callback:
+            progress_callback(f"Clip {clip_num}/{total_clips}: Applying 16:9 landscape framing ({crop_mode.value})...")
+        await asyncio.to_thread(
+            video_cropper.crop_to_vertical,
+            raw_video_path=source_path,
+            start_time=start_time,
+            duration=clip_dur,
+            output_cropped_path=cropped_path,
+            mode=crop_mode,
+            mask_webcam=True,
+            webcam_corner=webcam_corner
+        )
+
+        # 2. Extract Gameplay Audio Segment
+        import subprocess
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-ss", str(start_time),
+            "-t", str(clip_dur),
+            "-i", str(source_path),
+            "-vn", "-c:a", "pcm_s16le", "-ar", "48000",
+            str(seg_audio)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 3. Strip Copyright Radio or Streamer Mic Voice via Demucs AI
     should_strip_voice = (
@@ -462,8 +537,20 @@ async def execute_job_pipeline(job_id: str):
             # Keep overlay_path null to prevent callout rectangle box popups
             clip["overlay_path"] = None
 
-        # Step 5: Autonomous AI Render of All Clips with Hardware Acceleration
+        # Step 5: Check Operating Mode (Manual Topic Selection vs Autonomous Batch Render)
         total_clips = len(job["clips"])
+        is_manual_review = (getattr(req, "mode", OperatingMode.AUTO_PILOT) in (OperatingMode.MANUAL_STUDIO, "manual_studio"))
+        if is_manual_review:
+            logger.info(f"Job {job_id} is in MANUAL_STUDIO mode. {total_clips} topics extracted for user review.")
+            await send_progress(
+                100,
+                f"Discovered {total_clips} real mission topics! Review and select which ones to render in Studio.",
+                JobStatus.COMPLETED,
+                {"clips": job["clips"], "plan": job["plan"], "metadata": job.get("metadata", {})}
+            )
+            return
+
+        # Autonomous AI Render of All Clips with Hardware Acceleration
         for idx in range(total_clips):
             clip_num = idx + 1
             base_pct = 75 + int((idx / total_clips) * 22)

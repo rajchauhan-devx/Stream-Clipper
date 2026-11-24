@@ -83,12 +83,23 @@ class SocialMetadata(BaseModel):
 # ------------------------------------------------------------------------------
 # Clip & Director Plan Schemas
 # ------------------------------------------------------------------------------
+class StoryBeat(BaseModel):
+    beat_id: str = Field(..., description="Unique beat identifier (e.g., beat_1, setup, climax)")
+    label: str = Field(..., description="Short punchy beat title (e.g. 'Mission Briefing', 'Infiltration', 'SWAT Ambush', 'Boat Escape')")
+    start_time: float = Field(..., description="Start timestamp in seconds from raw video")
+    duration: float = Field(..., description="Duration of this beat in seconds (typically 5s-14s)")
+    description: Optional[str] = Field(default="", description="What happens visually in this beat")
+
 class ClipBlueprint(BaseModel):
     clip_id: str = Field(..., description="Unique clip identifier (e.g., clip_1)")
-    start_time: float = Field(..., description="Start timestamp in seconds from raw video")
+    clip_type: str = Field(default="story_montage", description="'story_montage' for multi-beat narrative arc or 'single_moment' for continuous action")
+    start_time: float = Field(..., description="Start timestamp in seconds from raw video (or first beat start)")
     end_time: float = Field(..., description="End timestamp in seconds from raw video")
-    duration: float = Field(..., description="Duration in seconds (typically 30s-55s)")
+    duration: float = Field(..., description="Total combined duration in seconds (typically 30s-55s)")
+    beats: List[StoryBeat] = Field(default_factory=list, description="List of 2-4 narrative story beats stitched together into one short")
     virality_score: int = Field(..., ge=1, le=100, description="Virality potential rating from 1 to 100")
+    reviewer_score: int = Field(default=92, ge=1, le=100, description="Senior Reviewer AI quality rating from 1 to 100")
+    reviewer_verdict: str = Field(default="Approved: High-retention story arc with zero dead air", description="Senior Reviewer audit notes")
     hook_text: str = Field(..., description="Immediate attention-grabbing visual hook text (0-3s)")
     hook_summary: str = Field(..., description="Brief 1-sentence synopsis of why this moment is viral")
     commentary_script: str = Field(..., description="Ultra-short punchy opening hook (4-7 words maximum, finishes under 2.5s)")
@@ -101,6 +112,7 @@ class ClipBlueprint(BaseModel):
     caption_style: CaptionStyle = Field(default=CaptionStyle.HORMOZI_YELLOW, description="Subtitle visual preset")
     voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.HOOK_ONLY, description="Pacing: 3-6s hook only or full commentary")
     tts_voice: str = Field(default="Charon", description="Gemini TTS voice persona: Charon (cinematic/storytelling male), Aoede (smooth female), Kore (calm female), Fenrir (commanding male), Puck (energetic)")
+    is_pure_gameplay: bool = Field(default=True, description="True if clip contains pure in-game footage without full-screen streamer webcam/talking head")
     social_metadata: SocialMetadata
     rendered_video_path: Optional[str] = Field(default=None, description="Local path to final 1080x1920 MP4")
     preview_url: Optional[str] = Field(default=None, description="Static URL to stream preview in Studio UI")
@@ -109,6 +121,8 @@ class ClipBlueprint(BaseModel):
 class DirectorPlan(BaseModel):
     source_title: str = Field(..., description="Title of the input gameplay video")
     duration_seconds: float = Field(..., description="Total duration of analyzed gameplay video")
+    intro_end_time: float = Field(default=0.0, description="Timestamp in seconds where streamer full-screen talking-head intro ends and pure in-game gameplay starts")
+    reviewer_summary: str = Field(default="Senior Reviewer approved: High-retention story arcs with zero dead air.", description="Senior Reviewer overall evaluation")
     detected_radio_songs: List[str] = Field(default_factory=list, description="All copyrighted tracks detected")
     overall_analysis: str = Field(..., description="Gemini Vision director notes on gameplay pace and highlights")
     clips: List[ClipBlueprint] = Field(..., min_length=1, description="List of generated clip blueprints")

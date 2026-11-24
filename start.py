@@ -136,8 +136,8 @@ def main():
 
         # 3. Wait for services to become healthy
         print("\n[*] Waiting for servers to initialize...")
-        backend_online = wait_for_port("http://127.0.0.1:8000/api/health", max_retries=20)
-        frontend_online = wait_for_port("http://localhost:5173", max_retries=20)
+        backend_online = wait_for_port("http://127.0.0.1:8000/api/health", max_retries=50)
+        frontend_online = wait_for_port("http://localhost:5173", max_retries=50)
 
         if backend_online and frontend_online:
             print("\n" + "=" * 70)
