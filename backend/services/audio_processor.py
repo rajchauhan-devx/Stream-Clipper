@@ -1,6 +1,7 @@
 import gc
 import os
 import sys
+import uuid
 import shutil
 import logging
 import subprocess
@@ -30,7 +31,7 @@ class AudioProcessor:
             progress_callback(5, "Running Demucs audio separation to strip copyrighted radio...")
 
         logger.info(f"Stripping copyrighted radio from {audio_segment_path} using Demucs...")
-        demucs_out_dir = self.temp_dir / "demucs_out"
+        demucs_out_dir = self.temp_dir / f"demucs_out_{uuid.uuid4().hex[:8]}"
         demucs_out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -54,23 +55,23 @@ class AudioProcessor:
                 shutil.copy2(isolated_no_vocals, output_clean_path)
                 logger.info(f"Demucs voice separation successful: {output_clean_path}")
             else:
-                logger.warning("Demucs no_vocals file missing or empty. Using attenuated fallback.")
-                # Attenuate audio so streamer voice is muffled
+                logger.warning("Demucs no_vocals file missing or empty. Muting source so original dialogue cannot return.")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", str(audio_segment_path),
-                    "-af", "volume=0.35,lowpass=f=2500",
+                    "-af", "volume=0",
                     str(output_clean_path)
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         except Exception as e:
-            logger.warning(f"Demucs separation encountered issue ({e}). Fallback to muffled audio.")
+            logger.warning(f"Demucs separation encountered issue ({e}). Muting source so original dialogue cannot return.")
             subprocess.run([
                 "ffmpeg", "-y", "-i", str(audio_segment_path),
-                "-af", "volume=0.35,lowpass=f=2500",
+                "-af", "volume=0",
                 str(output_clean_path)
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         finally:
+            shutil.rmtree(demucs_out_dir, ignore_errors=True)
             # Strict VRAM and unified memory cleanup
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -106,11 +107,12 @@ class AudioProcessor:
         # amix with duration=first ensures the mixed output NEVER truncates when the voiceover finishes!
         boost = max(0.5, min(3.0, float(game_volume_boost)))
         filter_complex = (
-            f"[0:a]volume={boost:.2f},alimiter=limit=0.95[boosted_game];"
-            "[1:a]apad[voice_padded];"
+            f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={boost:.2f},alimiter=limit=0.95[boosted_game];"
+            "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,apad[voice_padded];"
             "[boosted_game][voice_padded]sidechaincompress="
             "threshold=0.03:ratio=10:attack=15:release=250[ducked];"
-            "[ducked][1:a]amix=inputs=2:duration=first:weights=1.0 1.5:dropout_transition=2[aout]"
+            "[1:a]aformat=sample_rates=48000:channel_layouts=stereo[voice_norm];"
+            "[ducked][voice_norm]amix=inputs=2:duration=first:weights=1.0 1.5:dropout_transition=2[aout]"
         )
 
         # Determine codec based on file extension

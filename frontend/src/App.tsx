@@ -75,11 +75,15 @@ interface StoryBeat {
   start_time: number;
   duration: number;
   description?: string;
+  narration?: string;
+  role?: string;
+  evidence_id?: string;
 }
 
 interface Clip {
   clip_id: string;
   clip_type?: 'story_montage' | 'single_moment';
+  video_format?: 'highlight' | 'explainer';
   start_time: number;
   end_time: number;
   duration: number;
@@ -87,6 +91,8 @@ interface Clip {
   virality_score: number;
   reviewer_score?: number;
   reviewer_verdict?: string;
+  verification_passed?: boolean;
+  verification_notes?: string;
   hook_text: string;
   hook_summary: string;
   commentary_script: string;
@@ -164,17 +170,22 @@ export default function App() {
   const [compTtsVoice, setCompTtsVoice] = useState('Charon');
   const [isRenderingComp, setIsRenderingComp] = useState(false);
   const [compRenderResult, setCompRenderResult] = useState<any>(null);
+  const [savedComparisons, setSavedComparisons] = useState<any[]>([]);
   const [compRenderError, setCompRenderError] = useState<string | null>(null);
 
   // Form states
   const [urlOrFile, setUrlOrFile] = useState('');
-  const [language, setLanguage] = useState('hinglish');
+  const language = 'english';
   const [clipLength, setClipLength] = useState('30s-55s');
   const [clipCount, setClipCount] = useState(3);
+  const [videoFormat, setVideoFormat] = useState<'explainer' | 'highlight'>('explainer');
+  const [explainerTopic, setExplainerTopic] = useState('');
   const [copyrightGuard, setCopyrightGuard] = useState(true);
   const [stripStreamerVoice, setStripStreamerVoice] = useState(true);
   const [voiceoverPacing, setVoiceoverPacing] = useState<'hook_only' | 'full_commentary'>('full_commentary');
   const [selectedVoice, setSelectedVoice] = useState('Charon');
+  const [selectedCropMode, setSelectedCropMode] = useState<'center_zoom' | 'facecam_split' | 'action_track'>('center_zoom');
+  const [selectedCaptionStyle, setSelectedCaptionStyle] = useState<'hormozi_yellow' | 'neon_cyan' | 'clean_white'>('hormozi_yellow');
   const [isRevoicing, setIsRevoicing] = useState(false);
   const [isRenderingClip, setIsRenderingClip] = useState(false);
   const [cutStartTime, setCutStartTime] = useState('00:00:00');
@@ -183,12 +194,14 @@ export default function App() {
   const [gameVolumeBoost, setGameVolumeBoost] = useState<number>(1.5);
   const [enableWatermarkMasker, setEnableWatermarkMasker] = useState(true);
   const [enableTopicHeader, setEnableTopicHeader] = useState(true);
+  const [enableCloseupVerify, setEnableCloseupVerify] = useState(true);
   const [longVideoStrategy, setLongVideoStrategy] = useState<'segment_hopper' | 'full_vod_batch' | 'energy_peaks'>('segment_hopper');
   const [jobMetadata, setJobMetadata] = useState<any>(null);
   const [isLaunching, setIsLaunching] = useState(false);
 
   // Pipeline execution & live WebSocket state
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [allJobs, setAllJobs] = useState<any[]>([]);
   const [progressPct, setProgressPct] = useState(0);
   const [progressMsg, setProgressMsg] = useState('Ready to launch');
   const [pipelineError, setPipelineError] = useState<string | null>(null);
@@ -198,9 +211,22 @@ export default function App() {
   const [showSafeZones, setShowSafeZones] = useState(true);
   const [isResetting, setIsResetting] = useState(false);
   const [resetBanner, setResetBanner] = useState<string | null>(null);
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [showYtDisconnectModal, setShowYtDisconnectModal] = useState(false);
+  const [uiToast, setUiToast] = useState<{ kind: 'info' | 'success' | 'error'; text: string } | null>(null);
   const [activityLogs, setActivityLogs] = useState<{ timestamp: string; message: string }[]>([]);
   const [showLogs, setShowLogs] = useState(true);
   const logsEndRef = useRef<HTMLDivElement | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const ytPollIntervalRef = useRef<number | null>(null);
+
+  const showToast = (text: string, kind: 'info' | 'success' | 'error' = 'info') => {
+    setUiToast({ kind, text });
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => setUiToast(null), 5000);
+  };
 
   useEffect(() => {
     if (showLogs && logsEndRef.current) {
@@ -228,25 +254,178 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Fetch real-time hardware status and existing settings
-  useEffect(() => {
-    fetch('/api/hardware')
-      .then((res) => res.json())
-      .then((data) => setHardware(data))
-      .catch((err) => console.warn('Could not fetch hardware info:', err));
+  const isActiveStatus = (status?: string) =>
+    ['pending', 'ingesting', 'analyzing', 'voicing', 'cropping', 'captioning', 'rendering'].includes(status || '');
 
-    fetch('/api/settings')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.is_adc) {
-          setIsAdc(true);
-          setAdcProject(data.adc_project || '');
+  const mapStatusToStep = (status?: string): 'idle' | 'ingesting' | 'analyzing' | 'voicing' | 'completed' => {
+    if (status === 'ingesting' || status === 'pending') return 'ingesting';
+    if (status === 'analyzing') return 'analyzing';
+    if (status === 'voicing' || status === 'cropping' || status === 'captioning' || status === 'rendering') return 'voicing';
+    if (status === 'completed') return 'completed';
+    return 'idle';
+  };
+
+  const connectJobWebSocket = (jobId: string) => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/progress/${jobId}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.event === 'state_snapshot' && msg.job) {
+          const snap = msg.job;
+          setProgressPct(snap.progress_pct || 0);
+          setProgressMsg(snap.step || '');
+          setPipelineStep(mapStatusToStep(snap.status));
+          setIsLaunching(isActiveStatus(snap.status));
+          if (snap.status === 'failed' && snap.error) {
+            setPipelineError(snap.error);
+          }
+          if (snap.metadata) setJobMetadata(snap.metadata);
+          if (Array.isArray(snap.clips) && snap.clips.length > 0) {
+            setClips(snap.clips);
+          }
+        } else if (msg.event === 'progress') {
+          setProgressPct(msg.progress_pct);
+          setProgressMsg(msg.message);
+
+          const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          setActivityLogs((prev) => {
+            if (prev.length > 0 && prev[prev.length - 1].message === msg.message) {
+              return prev;
+            }
+            return [...prev.slice(-60), { timestamp: now, message: msg.message }];
+          });
+
+          setPipelineStep(mapStatusToStep(msg.status));
+          if (msg.status === 'completed') {
+            setIsLaunching(false);
+            refreshAllJobs();
+            if (msg.data) {
+              if (msg.data.clips) setClips(msg.data.clips);
+              if (msg.data.metadata) setJobMetadata(msg.data.metadata);
+              setActiveTab('studio');
+            }
+          } else if (msg.status === 'failed' || msg.status === 'cancelled') {
+            setIsLaunching(false);
+            refreshAllJobs();
+          }
+        } else if (msg.event === 'clip_rendering') {
+          setIsRenderingClip(true);
+          setClips((prev) =>
+            prev.map((c) => (c.clip_id === msg.clip_id ? { ...c, status: 'rendering' } : c))
+          );
+        } else if (msg.event === 'clip_rendered') {
+          setClips((prev) =>
+            prev.map((c) =>
+              c.clip_id === msg.clip_id
+                ? { ...c, preview_url: msg.preview_url, status: 'rendered' }
+                : c
+            )
+          );
+          setIsRenderingClip(false);
+        } else if (msg.event === 'clip_render_error') {
+          setClips((prev) =>
+            prev.map((c) => (c.clip_id === msg.clip_id ? { ...c, status: 'error' } : c))
+          );
+          setIsRenderingClip(false);
+          showToast(`Clip render failed: ${msg.message || 'Unknown error'}`, 'error');
+        } else if (msg.event === 'job_cancelled') {
+          setActiveJobId(null);
+      setAllJobs([]);
+      setSavedComparisons([]);
+      setCompRenderResult(null);
+          setProgressPct(0);
+          setProgressMsg(msg.message || 'Pipeline cancelled.');
+          setPipelineStep('idle');
+          setIsLaunching(false);
+        } else if (msg.event === 'error') {
+          setIsLaunching(false);
+          setPipelineError(msg.message || 'Pipeline encountered an error.');
+          setProgressMsg(msg.message || 'Error occurred');
+          const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          setActivityLogs((prev) => [...prev.slice(-60), { timestamp: now, message: `❌ ${msg.message}` }]);
         }
+      } catch (e) {
+        console.error('Error parsing WS message:', e);
+      }
+    };
+
+    ws.onerror = (err) => console.warn('WebSocket error:', err);
+  };
+
+  const refreshAllJobs = () => {
+    fetch('/api/jobs')
+      .then((res) => (res.ok ? res.json() : []))
+      .then((jobs) => {
+        if (Array.isArray(jobs)) {
+          setAllJobs([...jobs].reverse());
+        }
+      })
+      .catch(() => {});
+  };
+
+  const refreshSavedComparisons = (selectLatest = false) => {
+    fetch('/api/comparison/list')
+      .then((res) => (res.ok ? res.json() : []))
+      .then((items) => {
+        if (Array.isArray(items)) {
+          setSavedComparisons(items);
+          if (selectLatest && items.length > 0) {
+            setCompRenderResult(items[0]);
+          }
+        }
+      })
+      .catch(() => {});
+  };
+
+  const selectSavedJob = (job: any) => {
+    if (!job || !job.job_id) return;
+    setActiveJobId(job.job_id);
+    setProgressPct(job.progress_pct || 0);
+    setProgressMsg(job.step || '');
+    setPipelineStep(mapStatusToStep(job.status));
+    setPipelineError(job.status === 'failed' ? (job.error || 'Job failed') : null);
+    setJobMetadata(job.metadata || null);
+    setClips(Array.isArray(job.clips) ? job.clips : []);
+    setSelectedClipIndex(0);
+    connectJobWebSocket(job.job_id);
+  };
+
+  const refreshSettings = () => {
+    fetch('/api/settings')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data) return;
+        setIsAdc(Boolean(data.is_adc));
+        setAdcProject(data.adc_project || '');
         if (data.director_model) setDirectorModel(data.director_model);
         if (data.tts_model) setTtsModel(data.tts_model);
         if (data.image_model) setImageModel(data.image_model);
+        if (data.hardware) setHardware(data.hardware);
       })
       .catch(() => {});
+  };
+
+  // Fetch real-time hardware status and existing settings
+  useEffect(() => {
+    fetch('/api/hardware')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) setHardware(data);
+      })
+      .catch((err) => console.warn('Could not fetch hardware info:', err));
+
+    refreshSettings();
+    refreshAllJobs();
+    refreshSavedComparisons(true);
 
     // Automatically restore active or completed job on initial page load
     fetch('/api/jobs/latest')
@@ -256,28 +435,52 @@ export default function App() {
           setActiveJobId(job.job_id);
           setProgressPct(job.progress_pct || 0);
           setProgressMsg(job.step || '');
-          if (job.status === 'completed') {
-            setPipelineStep('completed');
+          setPipelineStep(mapStatusToStep(job.status));
+          if (job.status === 'failed' && job.error) {
+            setPipelineError(job.error);
           }
           if (job.metadata) setJobMetadata(job.metadata);
           if (job.clips && job.clips.length > 0) {
             setClips(job.clips);
             setActiveTab('studio');
           }
+          if (isActiveStatus(job.status)) {
+            setIsLaunching(true);
+          }
+          if (isActiveStatus(job.status) || (job.clips && job.clips.length > 0)) {
+            connectJobWebSocket(job.job_id);
+          }
         }
       })
       .catch((err) => console.warn('Could not restore latest job:', err));
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      if (ytPollIntervalRef.current) {
+        window.clearInterval(ytPollIntervalRef.current);
+      }
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
   }, []);
 
-  const handleLaunch = async (selectedMode: 'manual_studio' | 'auto_pilot' = 'manual_studio') => {
-    if (!urlOrFile) {
-      alert('Please enter a YouTube link or file path to raw gameplay.');
+  const handleLaunch = async (
+    selectedMode: 'manual_studio' | 'auto_pilot' = 'manual_studio',
+    overrideCutStartTime?: string
+  ) => {
+    if (!urlOrFile.trim()) {
+      showToast('Please enter a YouTube link or file path to raw gameplay.', 'error');
       return;
     }
+    const effectiveCutStart = overrideCutStartTime ?? cutStartTime;
     setIsLaunching(true);
     setPipelineError(null);
     setProgressPct(5);
-    setProgressMsg(selectedMode === 'manual_studio' ? 'Scanning video to extract all real missions...' : 'Initializing autonomous batch pipeline...');
+    setProgressMsg(videoFormat === 'explainer' ? 'Reading the source to discover complete explanations...' : selectedMode === 'manual_studio' ? 'Scanning video to extract all real missions...' : 'Initializing autonomous batch pipeline...');
     setPipelineStep('ingesting');
     const initialTime = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     setActivityLogs([{
@@ -290,107 +493,53 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          url_or_path: urlOrFile,
+          url_or_path: urlOrFile.trim(),
           mode: selectedMode,
+          video_format: videoFormat,
+          explainer_topic: videoFormat === 'explainer' ? explainerTopic.trim() : '',
           target_language: language,
           clip_length_range: clipLength,
           clip_count: clipCount,
           copyright_guard: copyrightGuard,
           strip_streamer_voice: stripStreamerVoice,
-          voiceover_pacing: voiceoverPacing,
+          voiceover_pacing: videoFormat === 'explainer' ? 'full_commentary' : voiceoverPacing,
           tts_voice: selectedVoice,
+          crop_mode: selectedCropMode,
+          caption_style: selectedCaptionStyle,
           enable_callout_overlay: false,
-          cut_start_time: cutStartTime,
+          cut_start_time: effectiveCutStart,
           cut_duration_mins: cutDurationMins,
           auto_cut_long_videos: autoCutLong,
           game_volume_boost: gameVolumeBoost,
           enable_watermark_masker: enableWatermarkMasker,
           enable_topic_header: enableTopicHeader,
+          enable_closeup_verify: videoFormat === 'explainer' || enableCloseupVerify,
           long_video_strategy: longVideoStrategy,
         }),
       });
       const data = await res.json();
+      if (!res.ok || !data.job_id) {
+        throw new Error(data.detail || 'Failed to launch job pipeline.');
+      }
       const jobId = data.job_id;
       setActiveJobId(jobId);
-
-      // Establish WebSocket for real-time progress updates
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.host}/ws/progress/${jobId}`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.event === 'progress') {
-            setProgressPct(msg.progress_pct);
-            setProgressMsg(msg.message);
-
-            const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            setActivityLogs((prev) => {
-              if (prev.length > 0 && prev[prev.length - 1].message === msg.message) {
-                return prev;
-              }
-              return [...prev.slice(-60), { timestamp: now, message: msg.message }];
-            });
-
-            if (msg.status === 'ingesting') setPipelineStep('ingesting');
-            else if (msg.status === 'analyzing') setPipelineStep('analyzing');
-            else if (msg.status === 'voicing') setPipelineStep('voicing');
-            else if (msg.status === 'completed' || msg.status === 'cropping') {
-              setPipelineStep('completed');
-              if (msg.data) {
-                if (msg.data.clips) setClips(msg.data.clips);
-                if (msg.data.metadata) setJobMetadata(msg.data.metadata);
-                setActiveTab('studio');
-              }
-            }
-          } else if (msg.event === 'clip_rendering') {
-            setIsRenderingClip(true);
-          } else if (msg.event === 'clip_rendered') {
-            setClips((prev) =>
-              prev.map((c) =>
-                c.clip_id === msg.clip_id
-                  ? { ...c, preview_url: msg.preview_url, status: 'rendered' }
-                  : c
-              )
-            );
-            setIsRenderingClip(false);
-          } else if (msg.event === 'job_cancelled') {
-            setActiveJobId(null);
-            setProgressPct(0);
-            setProgressMsg(msg.message || 'Pipeline cancelled.');
-            setPipelineStep('idle');
-            setIsLaunching(false);
-          } else if (msg.event === 'error') {
-            setIsLaunching(false);
-            setPipelineError(msg.message || 'Pipeline encountered an error.');
-            setProgressMsg(msg.message || 'Error occurred');
-            const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            setActivityLogs((prev) => [...prev.slice(-60), { timestamp: now, message: `❌ ${msg.message}` }]);
-          }
-        } catch (e) {
-          console.error('Error parsing WS message:', e);
-        }
-      };
-
-      ws.onerror = (err) => console.warn('WebSocket error:', err);
-    } catch (err) {
+      connectJobWebSocket(jobId);
+    } catch (err: any) {
       console.error(err);
-      alert('Error launching job pipeline.');
-    } finally {
       setIsLaunching(false);
+      setPipelineStep('idle');
+      setPipelineError(err?.message || 'Error launching job pipeline.');
+      showToast(err?.message || 'Error launching job pipeline.', 'error');
     }
   };
 
   const handleStopAndReset = async (skipConfirm = false) => {
     if (!skipConfirm) {
-      const ok = window.confirm(
-        '🛑 Are you sure you want to completely RESET all data?\n\nThis will permanently DELETE:\n• All downloaded raw YouTube videos\n• All generated vertical video clips\n• All voiceovers, topic banners, and proxies\n• All jobs history'
-      );
-      if (!ok) return;
+      setShowResetModal(true);
+      return;
     }
 
+    setShowResetModal(false);
     setIsResetting(true);
     try {
       if (wsRef.current) {
@@ -407,13 +556,20 @@ export default function App() {
         }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to reset workspace.');
+      }
 
       setActiveJobId(null);
+      setAllJobs([]);
+      setSavedComparisons([]);
+      setCompRenderResult(null);
       setProgressPct(0);
       setProgressMsg('All data reset. Workspace is completely clean.');
       setPipelineError(null);
       setPipelineStep('idle');
       setIsLaunching(false);
+      setIsRenderingClip(false);
       setClips([]);
       setSelectedClipIndex(0);
       setUrlOrFile('');
@@ -433,9 +589,9 @@ export default function App() {
         `✅ Complete reset successful! Deleted all downloaded videos, clips, and assets. Freed ${data.freed_mb || 0} MB disk space.`
       );
       setTimeout(() => setResetBanner(null), 8000);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Reset error:', err);
-      alert('Error resetting data.');
+      showToast(err?.message || 'Error resetting data.', 'error');
     } finally {
       setIsResetting(false);
     }
@@ -444,16 +600,21 @@ export default function App() {
   const handleUpdateCurrentClip = async (fields: Partial<Clip>) => {
     if (!activeJobId || clips.length === 0) return;
     const currentClip = clips[selectedClipIndex];
+    if (!currentClip) return;
     const updatedClips = [...clips];
     updatedClips[selectedClipIndex] = { ...currentClip, ...fields };
     setClips(updatedClips);
 
     try {
-      await fetch(`/api/jobs/${activeJobId}/clips/${currentClip.clip_id}`, {
+      const res = await fetch(`/api/jobs/${activeJobId}/clips/${currentClip.clip_id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(fields),
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.warn('Could not sync clip update:', err.detail || res.statusText);
+      }
     } catch (e) {
       console.warn('Could not sync clip update:', e);
     }
@@ -461,9 +622,12 @@ export default function App() {
 
   const handleRenderSelectedClip = async () => {
     if (!activeJobId || !activeClip) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      connectJobWebSocket(activeJobId);
+    }
     setIsRenderingClip(true);
     try {
-      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}`, {
+      const patchRes = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -474,22 +638,33 @@ export default function App() {
           tts_voice: activeClip.tts_voice || 'Charon',
         }),
       });
+      if (!patchRes.ok) {
+        const err = await patchRes.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to save clip edits before rendering');
+      }
       const res = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/render`, {
         method: 'POST',
       });
-      if (!res.ok) throw new Error('Render request failed');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Render request failed');
+      }
     } catch (err: any) {
       console.error('Failed to render clip:', err);
-      alert(`Render error: ${err.message}`);
+      showToast(`Render error: ${err.message}`, 'error');
       setIsRenderingClip(false);
     }
   };
 
   const handleRegenerateVoiceAndRender = async () => {
     if (!activeJobId || !activeClip) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      connectJobWebSocket(activeJobId);
+    }
     setIsRevoicing(true);
+    setIsRenderingClip(true);
     try {
-      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}`, {
+      const patchRes = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -498,16 +673,29 @@ export default function App() {
           tts_voice: activeClip.tts_voice || 'Charon',
         }),
       });
-      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/regenerate-voice`, {
+      if (!patchRes.ok) {
+        const err = await patchRes.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to update clip metadata');
+      }
+      const voiceRes = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/regenerate-voice`, {
         method: 'POST',
       });
-      await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/render`, {
+      if (!voiceRes.ok) {
+        const err = await voiceRes.json().catch(() => ({}));
+        throw new Error(err.detail || 'Voiceover regeneration failed');
+      }
+      const renderRes = await fetch(`/api/jobs/${activeJobId}/clips/${activeClip.clip_id}/render`, {
         method: 'POST',
       });
-      alert('🎙️ Voiceover regenerated & re-rendering initiated!');
+      if (!renderRes.ok) {
+        const err = await renderRes.json().catch(() => ({}));
+        throw new Error(err.detail || 'Clip re-render failed to start');
+      }
+      showToast('Voiceover regenerated & re-rendering started.', 'success');
     } catch (err: any) {
       console.error('Failed to regenerate voice and render:', err);
-      alert(`Voice regeneration error: ${err.message}`);
+      setIsRenderingClip(false);
+      showToast(`Voice regeneration error: ${err.message}`, 'error');
     } finally {
       setIsRevoicing(false);
     }
@@ -531,6 +719,9 @@ export default function App() {
         }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to generate comparison quest');
+      }
       setCompQuest(data);
       if (data.hook_text) setCompHookText(data.hook_text);
       if (data.commentary_script) setCompCommentaryScript(data.commentary_script);
@@ -554,14 +745,18 @@ export default function App() {
         body: fd,
       });
       const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Recording upload failed');
+      }
       if (data.file_path) {
         setCompUploadedPath(data.file_path);
         setCompUploadedName(data.filename);
         setCompBaseUrl(data.file_path);
+        showToast(`Uploaded recording: ${data.filename}`, 'success');
       }
     } catch (e: any) {
       console.error('Recording upload failed:', e);
-      alert('Upload failed: ' + e.message);
+      showToast('Upload failed: ' + e.message, 'error');
     } finally {
       setIsUploadingRec(false);
     }
@@ -595,6 +790,7 @@ export default function App() {
       }
       const data = await res.json();
       setCompRenderResult(data);
+      refreshSavedComparisons(false);
     } catch (e: any) {
       console.error('Render comparison failed:', e);
       setCompRenderError(e.message || 'Comparison render failed');
@@ -634,7 +830,7 @@ export default function App() {
   const handlePublishPlatform = async (platform: 'youtube' | 'facebook' | 'instagram') => {
     if (!activeJobId || !activeClip) return;
     if (!activeClip.preview_url) {
-      alert('Please render this clip first before publishing.');
+      showToast('Please render this clip first before publishing.', 'error');
       return;
     }
 
@@ -646,12 +842,12 @@ export default function App() {
       const data = await res.json();
       if (res.ok && data.url) {
         setPublishUrls((prev) => ({ ...prev, [platform]: data.url }));
-        alert(`Published to ${platform.toUpperCase()}! Live URL: ${data.url}`);
+        showToast(`Published to ${platform.toUpperCase()}! Live URL: ${data.url}`, 'success');
       } else {
-        alert(`${platform.toUpperCase()} publishing note: ${data.detail || 'API token not configured. Use the 1-Click Export Pack for instant manual posting.'}`);
+        showToast(`${platform.toUpperCase()} publishing note: ${data.detail || 'API token not configured. Use the 1-Click Export Pack for instant manual posting.'}`, 'info');
       }
     } catch (err: any) {
-      alert(`Publishing to ${platform} error: ${err.message}`);
+      showToast(`Publishing to ${platform} error: ${err.message}`, 'error');
     } finally {
       setPublishingPlatform(null);
     }
@@ -673,13 +869,21 @@ export default function App() {
           image_model: imageModel,
         }),
       });
-      if (res.ok) {
-        setSettingsSaved(true);
-        setTimeout(() => setSettingsSaved(false), 3000);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to save settings.');
       }
-    } catch (e) {
+      setSettingsSaved(true);
+      refreshSettings();
+    refreshAllJobs();
+    refreshSavedComparisons(true);
+      fetchYtAuthStatus();
+      fetchFbAuthStatus();
+      showToast('Settings saved and applied.', 'success');
+      setTimeout(() => setSettingsSaved(false), 3000);
+    } catch (e: any) {
       console.error(e);
-      alert('Failed to save settings.');
+      showToast(e?.message || 'Failed to save settings.', 'error');
     }
   };
 
@@ -715,7 +919,7 @@ export default function App() {
   const handlePublishYouTubeDirect = async () => {
     if (!activeJobId || !activeClip) return;
     if (!activeClip.preview_url) {
-      alert('This clip is still rendering. Please wait until rendering completes.');
+      showToast('This clip is still rendering. Please wait until rendering completes.', 'info');
       return;
     }
     setYtPublishing(true);
@@ -725,18 +929,17 @@ export default function App() {
     let publishAtIso: string | undefined = undefined;
     if (ytPrivacy === 'scheduled') {
       if (!ytScheduleDate || !ytScheduleTime) {
-        alert('Please choose both a schedule date and time.');
+        showToast('Please choose both a schedule date and time.', 'error');
         setYtPublishing(false);
         return;
       }
-      try {
-        const localDt = new Date(`${ytScheduleDate}T${ytScheduleTime}:00`);
-        publishAtIso = localDt.toISOString();
-      } catch (err) {
-        alert('Invalid schedule date or time.');
+      const localDt = new Date(`${ytScheduleDate}T${ytScheduleTime}:00`);
+      if (Number.isNaN(localDt.getTime())) {
+        showToast('Invalid schedule date or time.', 'error');
         setYtPublishing(false);
         return;
       }
+      publishAtIso = localDt.toISOString();
     }
 
     try {
@@ -799,13 +1002,17 @@ export default function App() {
         }
       }
 
+      if (ytPollIntervalRef.current) {
+        window.clearInterval(ytPollIntervalRef.current);
+      }
       // Start polling for token completion
-      const pollInterval = setInterval(async () => {
+      const pollInterval = window.setInterval(async () => {
         try {
           const statusRes = await fetch('/api/youtube/status');
           const statusData = await statusRes.json();
           if (statusData.has_token) {
-            clearInterval(pollInterval);
+            window.clearInterval(pollInterval);
+            ytPollIntervalRef.current = null;
             setYtAuthStatus(statusData);
             setYtConnecting(false);
             setAuthPopupUrl(null);
@@ -814,51 +1021,69 @@ export default function App() {
           // ignore
         }
       }, 1500);
+      ytPollIntervalRef.current = pollInterval;
 
       // Stop polling after 4 minutes
-      setTimeout(() => {
-        clearInterval(pollInterval);
+      window.setTimeout(() => {
+        window.clearInterval(pollInterval);
+        if (ytPollIntervalRef.current === pollInterval) {
+          ytPollIntervalRef.current = null;
+        }
         setYtConnecting(false);
       }, 240000);
 
     } catch (e: any) {
-      alert(`YouTube Connection Error: ${e.message}`);
+      showToast(`YouTube Connection Error: ${e.message}`, 'error');
       setYtConnecting(false);
     }
   };
 
-  const handleDisconnectYouTube = async () => {
-    if (!confirm('Are you sure you want to disconnect this YouTube channel?')) return;
+  const handleDisconnectYouTube = async (skipConfirm = false) => {
+    if (!skipConfirm) {
+      setShowYtDisconnectModal(true);
+      return;
+    }
+    setShowYtDisconnectModal(false);
     try {
-      await fetch('/api/youtube/disconnect', { method: 'POST' });
+      const res = await fetch('/api/youtube/disconnect', { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Disconnect failed');
+      }
       await fetchYtAuthStatus();
+      showToast('YouTube channel disconnected.', 'info');
     } catch (e: any) {
-      alert(`Error disconnecting: ${e.message}`);
+      showToast(`Error disconnecting: ${e.message}`, 'error');
     }
   };
 
   const handleSaveClientSecret = async () => {
     if (!ytSecretContent.trim()) {
-      alert('Please paste the client_secret.json contents.');
+      showToast('Please paste the client_secret.json contents.', 'error');
       return;
     }
     try {
       JSON.parse(ytSecretContent);
+    } catch {
+      showToast('Invalid JSON content. Please ensure you pasted the exact client_secret.json file.', 'error');
+      return;
+    }
+    try {
       const res = await fetch('/api/youtube/client-secret', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: ytSecretContent }),
       });
       if (res.ok) {
-        alert('Client secret saved successfully! You can now authorize your channel.');
+        showToast('Client secret saved! You can now authorize your channel.', 'success');
         setYtSecretContent('');
         await fetchYtAuthStatus();
       } else {
-        const d = await res.json();
-        alert(d.detail || 'Failed to save secret.');
+        const d = await res.json().catch(() => ({}));
+        showToast(d.detail || 'Failed to save secret.', 'error');
       }
     } catch (e: any) {
-      alert('Invalid JSON content. Please ensure you pasted the exact client_secret.json file.');
+      showToast(e?.message || 'Failed to save client_secret.json.', 'error');
     }
   };
 
@@ -890,7 +1115,7 @@ export default function App() {
   const handlePublishFacebookDirect = async () => {
     if (!activeJobId || !activeClip) return;
     if (!activeClip.preview_url) {
-      alert('This clip is still rendering. Please wait until rendering completes.');
+      showToast('This clip is still rendering. Please wait until rendering completes.', 'info');
       return;
     }
     setFbPublishing(true);
@@ -900,18 +1125,17 @@ export default function App() {
     let scheduledEpoch: number | undefined = undefined;
     if (fbState === 'SCHEDULED') {
       if (!fbScheduleDate || !fbScheduleTime) {
-        alert('Please select both a schedule date and time.');
+        showToast('Please select both a schedule date and time.', 'error');
         setFbPublishing(false);
         return;
       }
-      try {
-        const localDt = new Date(`${fbScheduleDate}T${fbScheduleTime}:00`);
-        scheduledEpoch = Math.floor(localDt.getTime() / 1000);
-      } catch (e) {
-        alert('Invalid schedule date or time.');
+      const localDt = new Date(`${fbScheduleDate}T${fbScheduleTime}:00`);
+      if (Number.isNaN(localDt.getTime())) {
+        showToast('Invalid schedule date or time.', 'error');
         setFbPublishing(false);
         return;
       }
+      scheduledEpoch = Math.floor(localDt.getTime() / 1000);
     }
 
     try {
@@ -1174,6 +1398,33 @@ export default function App() {
                 </p>
               </div>
 
+              <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-5 space-y-3">
+                <p className="text-xs font-semibold text-slate-300">Video format</p>
+                <div className="flex gap-2">
+                  <button type="button" aria-pressed={videoFormat === 'explainer'} onClick={() => { setVideoFormat('explainer'); setVoiceoverPacing('full_commentary'); }}
+                    className={`px-4 py-2 rounded-lg text-sm font-semibold ${videoFormat === 'explainer' ? 'bg-indigo-600 text-white' : 'bg-[#0B0D12] text-slate-400'}`}>
+                    Explainer
+                  </button>
+                  <button type="button" aria-pressed={videoFormat === 'highlight'} onClick={() => setVideoFormat('highlight')}
+                    className={`px-4 py-2 rounded-lg text-sm font-semibold ${videoFormat === 'highlight' ? 'bg-indigo-600 text-white' : 'bg-[#0B0D12] text-slate-400'}`}>
+                    Highlight
+                  </button>
+                </div>
+                <p className="text-xs text-slate-400">
+                  {videoFormat === 'explainer'
+                    ? 'Turn an interesting story or topic from your long video into a short explanation. Keep the essential context, developments, and outcome with full voice commentary.'
+                    : 'Find action moments using the existing highlight selection workflow.'}
+                </p>
+                {videoFormat === 'explainer' && (
+                  <div>
+                    <label htmlFor="explainer-topic" className="block text-xs text-slate-300 mb-1">Topic to explain (optional)</label>
+                    <input id="explainer-topic" value={explainerTopic} onChange={(event) => setExplainerTopic(event.target.value)} maxLength={300}
+                      placeholder="Find interesting topics, or try: how the vehicle theft turned into a police chase"
+                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white" />
+                  </div>
+                )}
+              </div>
+
               {/* Ingest Dropzone Card */}
               <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-6 shadow-xl">
                 <label className="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-2">
@@ -1200,17 +1451,9 @@ export default function App() {
                   <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl">
                     <div className="flex items-center gap-2 mb-2 text-slate-300">
                       <Languages className="h-4 w-4 text-indigo-400" />
-                      <span className="text-xs font-semibold">Target Language</span>
+                      <span className="text-xs font-semibold">Narration Language</span>
                     </div>
-                    <select
-                      value={language}
-                      onChange={(e) => setLanguage(e.target.value)}
-                      className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
-                    >
-                      <option value="hinglish">Hinglish (Viral Gaming Tone)</option>
-                      <option value="english">English (US/UK Energetic)</option>
-                      <option value="hindi">Hindi (Pure Hindi)</option>
-                    </select>
+                    <p className="text-xs text-white">English only</p>
                   </div>
 
                   {/* Length & Count */}
@@ -1297,10 +1540,10 @@ export default function App() {
                     <ShieldCheck className="h-4 w-4 text-emerald-400" />
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-white">AI Watermark & Facecam Masker</span>
-                        <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono font-bold">SMART COVER</span>
+                        <span className="text-xs font-bold text-white">AI Facecam & Logo Removal</span>
+                        <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono font-bold">AI FILL</span>
                       </div>
-                      <p className="text-[10px] text-slate-400">Gemini Vision detects third-party channel watermarks, creator handles, and webcams, auto-covering them with a sleek GTA VI 4K 60FPS badge.</p>
+                      <p className="text-[10px] text-slate-400">AI reconstructs the game background behind streamer cameras, channel logos, and creator names.</p>
                     </div>
                   </div>
                   <button
@@ -1343,6 +1586,35 @@ export default function App() {
                   </button>
                 </div>
 
+                {/* Human-Like 5-FPS Close-Up Verification */}
+                {videoFormat === 'highlight' && (
+                <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
+                  <div className="flex items-center gap-2.5">
+                    <Eye className="h-4 w-4 text-cyan-400" />
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-white">Human-Like 5-FPS Close-Up Verify</span>
+                        <span className="text-[9px] bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 rounded font-mono font-bold">4-STAGE AI</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">Scouts 2x candidate clips with audio + energy cues, then inspects each at 5 FPS to reject duds and trim cuts to 0.2s accuracy.</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setEnableCloseupVerify(!enableCloseupVerify)}
+                    className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
+                      enableCloseupVerify ? 'bg-cyan-500' : 'bg-slate-700'
+                    }`}
+                  >
+                    <div
+                      className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${
+                        enableCloseupVerify ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                )}
+
                 {/* Voiceover Pacing Mode */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4 gap-3">
                   <div className="flex items-center gap-2.5">
@@ -1355,8 +1627,10 @@ export default function App() {
                         </span>
                       </div>
                       <p className="text-[10px] text-slate-400 mt-0.5">
-                        {voiceoverPacing === 'full_commentary'
-                          ? '🔥 Story Lore Breakdown: Curiosity hook question, step-by-step mission progression, moral choices, and twist ending.'
+                        {videoFormat === 'explainer'
+                          ? 'Full commentary explains each selected scene. Context and outcomes are checked against the footage, and narration follows the scene changes.'
+                          : voiceoverPacing === 'full_commentary'
+                          ? 'Full commentary follows the selected gameplay story.'
                           : '⚡ 3-6s Hook Only: Speaks a quick viral hook at the start, then raw gameplay audio takes over.'}
                       </p>
                     </div>
@@ -1374,6 +1648,7 @@ export default function App() {
                     </button>
                     <button
                       onClick={() => setVoiceoverPacing('hook_only')}
+                      disabled={videoFormat === 'explainer'}
                       className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
                         voiceoverPacing === 'hook_only'
                           ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
@@ -1409,9 +1684,51 @@ export default function App() {
                   </select>
                 </div>
 
+                {/* Framing & Caption Style Preset */}
+                <div className="bg-[#0B0D12] border border-[#1F2430] p-3.5 rounded-xl mt-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <Layers className="h-3.5 w-3.5 text-fuchsia-400" />
+                      Framing & Caption Style Preset
+                    </span>
+                    <p className="text-[10px] text-slate-400 mt-0.5">
+                      Choose 9:16 video layout (Center Zoom, Facecam Split, or Action Track) and dynamic caption theme.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2 shrink-0">
+                    <select
+                      value={selectedCropMode}
+                      onChange={(e) => setSelectedCropMode(e.target.value as any)}
+                      className="bg-[#141821] border border-[#1F2430] text-xs text-white rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-fuchsia-500 font-mono"
+                    >
+                      <option value="center_zoom">Center Zoom (16:9 + Blur)</option>
+                      <option value="facecam_split">Facecam Split (35% Cam)</option>
+                      <option value="action_track">Action Track (Full 9:16)</option>
+                    </select>
+                    <select
+                      value={selectedCaptionStyle}
+                      onChange={(e) => setSelectedCaptionStyle(e.target.value as any)}
+                      className="bg-[#141821] border border-[#1F2430] text-xs text-white rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-fuchsia-500 font-mono"
+                    >
+                      <option value="hormozi_yellow">Hormozi Yellow</option>
+                      <option value="neon_cyan">Neon Cyan</option>
+                      <option value="clean_white">Clean White / Neon Green</option>
+                    </select>
+                  </div>
+                </div>
+
 
 
                 {/* Video Cutter & AI Analysis Window */}
+                {videoFormat === 'explainer' ? (
+                  <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl mt-3 space-y-2">
+                    <p className="text-xs font-bold text-white">Complete story discovery</p>
+                    <p className="text-xs text-slate-400">Scans the video from the starting point to the end, follows stories across sections, and checks every selected scene. Useful dialogue and setup are kept. You may get fewer results when no complete explanation is supported.</p>
+                    <label htmlFor="explainer-start" className="block text-xs text-slate-300">Scan from (HH:MM:SS)</label>
+                    <input id="explainer-start" value={cutStartTime} onChange={(event) => setCutStartTime(event.target.value)} placeholder="00:00:00"
+                      className="bg-[#141821] border border-[#1F2430] rounded-lg px-3 py-2 text-xs font-mono text-white" />
+                  </div>
+                ) : (
                 <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl mt-3">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
                     <div className="flex items-center gap-2">
@@ -1550,57 +1867,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* AI Watermark & Facecam Masker */}
-                <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
-                  <div className="flex items-center gap-2.5">
-                    <ShieldCheck className="h-4 w-4 text-emerald-400" />
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-white">AI Watermark & Facecam Masker</span>
-                        <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono font-bold">SMART COVER</span>
-                      </div>
-                      <p className="text-[10px] text-slate-400">Gemini Vision detects third-party channel watermarks, creator handles, and webcams, auto-covering them with a sleek GTA VI 4K 60FPS badge.</p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setEnableWatermarkMasker(!enableWatermarkMasker)}
-                    className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
-                      enableWatermarkMasker ? 'bg-emerald-500' : 'bg-slate-700'
-                    }`}
-                  >
-                    <div
-                      className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${
-                        enableWatermarkMasker ? 'translate-x-5' : 'translate-x-0'
-                      }`}
-                    />
-                  </button>
-                </div>
-
-                {/* Top Topic Headline Banner */}
-                <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
-                  <div className="flex items-center gap-2.5">
-                    <Zap className="h-4 w-4 text-fuchsia-400" />
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-white">Top Topic Headline Banner</span>
-                        <span className="text-[9px] bg-fuchsia-500/20 text-fuchsia-300 px-1.5 py-0.5 rounded font-mono font-bold">VIRAL HOOK</span>
-                      </div>
-                      <p className="text-[10px] text-slate-400">Renders an attractive glassmorphic topic headline card in the upper blurred zone to hook mute scrollers.</p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setEnableTopicHeader(!enableTopicHeader)}
-                    className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
-                      enableTopicHeader ? 'bg-fuchsia-500' : 'bg-slate-700'
-                    }`}
-                  >
-                    <div
-                      className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${
-                        enableTopicHeader ? 'translate-x-5' : 'translate-x-0'
-                      }`}
-                    />
-                  </button>
-                </div>
+                )}
 
                 {/* Game Audio SFX Boost */}
                 <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-3">
@@ -1860,15 +2127,43 @@ export default function App() {
 
           {/* VIEW 2: AI STUDIO (MANUAL REVIEW & REFINE WORKSPACE) */}
           {activeTab === 'studio' && (
-            <div className="h-full flex gap-6 overflow-hidden">
+            <div className="min-h-full xl:h-full flex flex-col xl:flex-row gap-4 xl:gap-5 overflow-y-auto xl:overflow-hidden">
               {/* Left Panel: Clip Selector Cards */}
-              <div className="w-80 shrink-0 flex flex-col gap-3 overflow-y-auto pr-1">
+              <div className="w-full xl:w-72 shrink-0 flex flex-col gap-3 xl:overflow-y-auto pr-1">
                 <div className="flex items-center justify-between pb-2 border-b border-[#1F2430]">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
                     Viral Clips ({clips.length})
                   </h3>
                   <span className="text-[10px] text-indigo-400 font-mono">Gemini Scored</span>
                 </div>
+
+                {/* Saved Job / Video Type Switcher */}
+                {allJobs.length > 1 && (
+                  <div className="bg-[#0B0D12] border border-[#1F2430] rounded-xl p-2.5 space-y-1.5">
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      Saved Projects ({allJobs.length})
+                    </label>
+                    <select
+                      value={activeJobId || ''}
+                      onChange={(e) => {
+                        const target = allJobs.find((j) => j.job_id === e.target.value);
+                        if (target) selectSavedJob(target);
+                      }}
+                      className="w-full bg-[#141821] border border-[#1F2430] rounded-lg px-2.5 py-1.5 text-[11px] text-white font-mono focus:outline-none focus:border-indigo-500"
+                    >
+                      {allJobs.map((j) => {
+                        const title = j.metadata?.title || j.plan?.source_title || j.job_id;
+                        const pacing = j.request?.voiceover_pacing || '';
+                        const cnt = Array.isArray(j.clips) ? j.clips.length : 0;
+                        return (
+                          <option key={j.job_id} value={j.job_id}>
+                            [{pacing === 'hook_only' ? 'HOOK' : 'STORY'}] {String(title).slice(0, 28)} ({cnt} clips)
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                )}
 
                 {/* Segment Hopper: Next Chapter Action Banner */}
                 {jobMetadata?.has_more_segments && (
@@ -1883,9 +2178,10 @@ export default function App() {
                     </p>
                     <button
                       onClick={() => {
-                        setCutStartTime(jobMetadata.next_segment_start);
+                        const nextStart = jobMetadata.next_segment_start;
+                        setCutStartTime(nextStart);
                         setActiveTab('new_project');
-                        setTimeout(() => handleLaunch(), 100);
+                        handleLaunch('manual_studio', nextStart);
                       }}
                       disabled={isLaunching}
                       className="w-full bg-amber-500 hover:bg-amber-400 text-black py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 shadow-sm"
@@ -1947,7 +2243,7 @@ export default function App() {
               </div>
 
               {/* Center Panel: Interactive 9:16 Video Player with Safe-Zone Guides */}
-              <div className="flex-1 flex flex-col items-center justify-center bg-[#141821] rounded-2xl border border-[#1F2430] p-4 relative overflow-hidden">
+              <div className="flex-1 min-w-[280px] min-h-[520px] flex flex-col items-center justify-center bg-[#141821] rounded-2xl border border-[#1F2430] p-4 relative overflow-hidden">
                 <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
                   <button
                     onClick={() => setShowSafeZones(!showSafeZones)}
@@ -1963,7 +2259,7 @@ export default function App() {
                 </div>
 
                 {/* 9:16 Vertical Video Frame */}
-                <div className="relative aspect-[9/16] h-[90%] max-h-[640px] rounded-2xl overflow-hidden bg-black border-2 border-[#1F2430] shadow-2xl flex items-center justify-center">
+                <div className="relative aspect-[9/16] h-[90%] min-w-[260px] max-h-[640px] rounded-2xl overflow-hidden bg-black border-2 border-[#1F2430] shadow-2xl flex items-center justify-center">
                   {activeClip?.preview_url ? (
                     <video
                       key={activeClip.preview_url}
@@ -1982,7 +2278,11 @@ export default function App() {
                       </p>
                       {activeClip && (
                         <p className="text-[10px] text-indigo-400 font-semibold mt-2">
-                          ⏳ Autonomous AI rendering in progress...
+                          {isRenderingClip || activeClip.status === 'rendering'
+                            ? '⏳ Rendering 9:16 Short...'
+                            : activeClip.status === 'error'
+                            ? '❌ Render failed — click Render to retry'
+                            : 'Ready to render — click button on right'}
                         </p>
                       )}
                     </div>
@@ -2026,7 +2326,7 @@ export default function App() {
 
               {/* Right Panel: AI Director Intelligence & Instant Export */}
               {activeClip && (
-                <div className="w-96 shrink-0 bg-[#141821] rounded-2xl border border-[#1F2430] p-5 flex flex-col gap-4 overflow-y-auto shadow-xl">
+                <div className="w-full xl:w-80 shrink-0 bg-[#141821] rounded-2xl border border-[#1F2430] p-4 xl:p-5 flex flex-col gap-4 xl:overflow-y-auto shadow-xl">
                   <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
                     <div>
                       <span className="text-[10px] font-mono uppercase tracking-wider text-indigo-400">Autonomous Cut</span>
@@ -2050,7 +2350,7 @@ export default function App() {
                         <span className="text-indigo-300 font-bold">Senior Reviewer & Quality Gate</span>
                       </div>
                       <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
-                        ⭐ Rating: {activeClip.reviewer_score || activeClip.virality_score}/100
+                        {activeClip.verification_passed ? '✓ 5-FPS Verified' : '⭐ Rating'}: {activeClip.reviewer_score || activeClip.virality_score}/100
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 leading-relaxed font-mono">
@@ -2077,6 +2377,12 @@ export default function App() {
                               <p className="text-xs font-semibold text-slate-200 truncate">{beat.label}</p>
                               {beat.description && (
                                 <p className="text-[10px] text-slate-400 truncate">{beat.description}</p>
+                              )}
+                              {beat.narration && (
+                                <p className="text-xs text-slate-300 mt-1">{beat.narration}</p>
+                              )}
+                              {activeClip.video_format === 'explainer' && (
+                                <p className="text-[10px] text-cyan-300 mt-1">{beat.role} · Source {beat.start_time.toFixed(1)}s–{(beat.start_time + beat.duration).toFixed(1)}s</p>
                               )}
                             </div>
                             <span className="text-[10px] font-mono text-cyan-300 bg-cyan-950/40 border border-cyan-800/40 px-1.5 py-0.5 rounded shrink-0">
@@ -2588,6 +2894,40 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Saved Comparison Renders Gallery */}
+              {savedComparisons.length > 0 && (
+                <div className="bg-[#141821] border border-[#1F2430] rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                      Saved Comparison Renders ({savedComparisons.length})
+                    </h3>
+                    <span className="text-[10px] font-mono text-slate-400">Stored in workspace/renders/</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                    {savedComparisons.map((item) => (
+                      <button
+                        key={item.comp_id}
+                        type="button"
+                        onClick={() => setCompRenderResult(item)}
+                        className={`text-left p-3 rounded-xl border transition-all ${
+                          compRenderResult?.comp_id === item.comp_id
+                            ? 'bg-[#1E2433] border-cyan-500/60 shadow-md'
+                            : 'bg-[#0B0D12] border-[#1F2430] hover:border-slate-600'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-300 font-bold">
+                            {item.format === 'shorts_split' ? '9:16 SHORTS' : '16:9 LONG'}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-500">{item.base_game?.toUpperCase()}</span>
+                        </div>
+                        <p className="text-xs font-semibold text-white truncate">{item.hook_text}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Live Preview Player & Download Section (Shows when rendered) */}
               {compRenderResult && (
                 <div className="bg-[#141821] border border-emerald-500/40 rounded-2xl p-6 shadow-2xl space-y-4">
@@ -2614,6 +2954,7 @@ export default function App() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
                     <div className="flex justify-center bg-[#0B0D12] rounded-xl p-4 border border-[#1F2430]">
                       <video
+                        key={compRenderResult.preview_url}
                         src={compRenderResult.preview_url}
                         controls
                         className={`rounded-lg shadow-xl max-h-[480px] ${
@@ -2640,7 +2981,7 @@ export default function App() {
                           onClick={() => {
                             const copyTxt = `${compRenderResult.social_metadata?.youtube?.title}\n\n${compRenderResult.commentary_script}\n\n${(compRenderResult.social_metadata?.youtube?.tags || []).join(' ')}`;
                             navigator.clipboard.writeText(copyTxt);
-                            alert('Copied formatted YouTube/Reels metadata to clipboard!');
+                            showToast('Copied formatted YouTube/Reels metadata to clipboard!', 'success');
                           }}
                           className="flex-1 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/40 text-indigo-200 py-2.5 px-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all"
                         >
@@ -2711,7 +3052,7 @@ export default function App() {
                           <SettingsIcon className="h-3.5 w-3.5" />
                         </button>
                         <button
-                          onClick={handleDisconnectYouTube}
+                          onClick={() => handleDisconnectYouTube(false)}
                           className="text-[10px] text-rose-400 hover:text-rose-300 font-medium px-1 hover:underline"
                           title="Disconnect Channel"
                         >
@@ -3304,7 +3645,7 @@ export default function App() {
                     <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#1F2430]">
                       {ytAuthStatus?.has_token ? (
                         <button
-                          onClick={handleDisconnectYouTube}
+                          onClick={() => handleDisconnectYouTube(false)}
                           className="px-3.5 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 hover:bg-rose-500/20 text-xs font-semibold transition-all"
                         >
                           Disconnect Channel
@@ -3919,8 +4260,10 @@ export default function App() {
                         value={activeClip?.social_metadata?.youtube.title || ''}
                         onChange={(e) => {
                           if (activeClip?.social_metadata) {
-                            const updated = { ...activeClip.social_metadata };
-                            updated.youtube.title = e.target.value;
+                            const updated: SocialMetadata = {
+                              ...activeClip.social_metadata,
+                              youtube: { ...activeClip.social_metadata.youtube, title: e.target.value },
+                            };
                             handleUpdateCurrentClip({ social_metadata: updated });
                           }
                         }}
@@ -3935,8 +4278,10 @@ export default function App() {
                         value={activeClip?.social_metadata?.youtube.description || ''}
                         onChange={(e) => {
                           if (activeClip?.social_metadata) {
-                            const updated = { ...activeClip.social_metadata };
-                            updated.youtube.description = e.target.value;
+                            const updated: SocialMetadata = {
+                              ...activeClip.social_metadata,
+                              youtube: { ...activeClip.social_metadata.youtube, description: e.target.value },
+                            };
                             handleUpdateCurrentClip({ social_metadata: updated });
                           }
                         }}
@@ -3950,8 +4295,10 @@ export default function App() {
                         value={activeClip?.social_metadata?.youtube.privacy || 'private'}
                         onChange={(e) => {
                           if (activeClip?.social_metadata) {
-                            const updated = { ...activeClip.social_metadata };
-                            updated.youtube.privacy = e.target.value;
+                            const updated: SocialMetadata = {
+                              ...activeClip.social_metadata,
+                              youtube: { ...activeClip.social_metadata.youtube, privacy: e.target.value },
+                            };
                             handleUpdateCurrentClip({ social_metadata: updated });
                           }
                         }}
@@ -4010,8 +4357,10 @@ export default function App() {
                         value={activeClip?.social_metadata?.instagram.caption || ''}
                         onChange={(e) => {
                           if (activeClip?.social_metadata) {
-                            const updated = { ...activeClip.social_metadata };
-                            updated.instagram.caption = e.target.value;
+                            const updated: SocialMetadata = {
+                              ...activeClip.social_metadata,
+                              instagram: { ...activeClip.social_metadata.instagram, caption: e.target.value },
+                            };
                             handleUpdateCurrentClip({ social_metadata: updated });
                           }
                         }}
@@ -4074,8 +4423,10 @@ export default function App() {
                         value={activeClip?.social_metadata?.facebook.caption || ''}
                         onChange={(e) => {
                           if (activeClip?.social_metadata) {
-                            const updated = { ...activeClip.social_metadata };
-                            updated.facebook.caption = e.target.value;
+                            const updated: SocialMetadata = {
+                              ...activeClip.social_metadata,
+                              facebook: { ...activeClip.social_metadata.facebook, caption: e.target.value },
+                            };
                             handleUpdateCurrentClip({ social_metadata: updated });
                           }
                         }}
@@ -4289,6 +4640,86 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {/* Non-blocking Floating Notification Toast */}
+      {uiToast && (
+        <div
+          className={`fixed bottom-5 right-5 z-50 max-w-md rounded-xl border px-4 py-3 text-xs shadow-2xl flex items-center gap-3 backdrop-blur-md ${
+            uiToast.kind === 'error'
+              ? 'bg-rose-950/90 border-rose-500/50 text-rose-100'
+              : uiToast.kind === 'success'
+              ? 'bg-emerald-950/90 border-emerald-500/50 text-emerald-100'
+              : 'bg-[#141821]/95 border-indigo-500/50 text-slate-100'
+          }`}
+        >
+          <span className="flex-1 leading-relaxed">{uiToast.text}</span>
+          <button
+            onClick={() => setUiToast(null)}
+            className="text-slate-400 hover:text-white shrink-0"
+            aria-label="Dismiss notification"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Workspace Reset Confirmation Modal */}
+      {showResetModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#141821] border border-rose-500/40 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-2.5 text-rose-400">
+              <Trash2 className="h-5 w-5" />
+              <h3 className="text-sm font-bold text-white">Confirm Complete Workspace Reset</h3>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              This will stop active pipeline jobs and permanently delete all downloaded raw videos, generated 9:16 clips, voiceovers, proxies, and job history.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowResetModal(false)}
+                className="px-4 py-2 rounded-lg bg-[#0B0D12] border border-[#1F2430] text-slate-300 hover:text-white text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleStopAndReset(true)}
+                className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
+              >
+                Delete Everything
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* YouTube Disconnect Confirmation Modal */}
+      {showYtDisconnectModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#141821] border border-[#1F2430] rounded-2xl max-w-sm w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-2.5 text-red-400">
+              <Youtube className="h-5 w-5" />
+              <h3 className="text-sm font-bold text-white">Disconnect YouTube Channel?</h3>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              This removes the saved local OAuth token. You can reconnect your channel at any time.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowYtDisconnectModal(false)}
+                className="px-4 py-2 rounded-lg bg-[#0B0D12] border border-[#1F2430] text-slate-300 hover:text-white text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleDisconnectYouTube(true)}
+                className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
+              >
+                Disconnect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

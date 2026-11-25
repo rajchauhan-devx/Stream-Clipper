@@ -17,7 +17,8 @@ from google_auth_oauthlib.flow import (
 )
 from google.auth.transport.requests import Request
 
-from backend.config import BASE_DIR, YOUTUBE_CLIENT_SECRETS_FILE
+import backend.config as app_config
+from backend.config import BASE_DIR
 
 logger = logging.getLogger("gta6-studio.publisher.youtube")
 
@@ -30,11 +31,15 @@ TOKEN_FILE = BASE_DIR / "youtube_token.json"
 
 class YouTubePublisher:
     def __init__(self):
-        self.secrets_file = Path(YOUTUBE_CLIENT_SECRETS_FILE)
+        self.secrets_file = Path(app_config.YOUTUBE_CLIENT_SECRETS_FILE)
         self._cached_channel_info: Optional[Dict[str, Any]] = None
         self._active_auth_server = None
         self._active_auth_thread = None
         self._current_auth_url: Optional[str] = None
+
+    def reload_config(self) -> None:
+        self.secrets_file = Path(app_config.YOUTUBE_CLIENT_SECRETS_FILE)
+        self._cached_channel_info = None
 
     def get_credentials(self) -> Optional[Credentials]:
         """Loads and validates existing credentials without blocking for user interaction"""
@@ -92,7 +97,11 @@ class YouTubePublisher:
                 local_server.timeout = 300  # 5 minutes
                 local_server.handle_request()
                 if wsgi_app.last_request_uri:
-                    auth_resp = wsgi_app.last_request_uri.replace("http", "https")
+                    auth_resp = (
+                        wsgi_app.last_request_uri.replace("http://", "https://", 1)
+                        if wsgi_app.last_request_uri.startswith("http://")
+                        else wsgi_app.last_request_uri
+                    )
                     flow.fetch_token(authorization_response=auth_resp)
                     TOKEN_FILE.write_text(flow.credentials.to_json(), encoding="utf-8")
                     self._cached_channel_info = None

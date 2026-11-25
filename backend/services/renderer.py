@@ -8,6 +8,17 @@ from backend.config import RENDERS_DIR, ASSETS_DIR, HARDWARE
 
 logger = logging.getLogger("gta6-studio.renderer")
 
+def _escape_ffmpeg_filter_path(path: Path) -> str:
+    """Two-level escaping for file paths passed to FFmpeg libass filter options."""
+    s = str(path).replace("\\", "/")
+    # Level 2 (filter option parser)
+    s = s.replace("'", "\\'").replace(":", "\\:")
+    # Level 1 (filtergraph parser)
+    for ch in ("\\", "'", ":", "[", "]", ",", ";", " "):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
 def _get_font(font_names, size: int):
     from PIL import ImageFont
     if isinstance(font_names, str):
@@ -35,22 +46,40 @@ class VideoRenderer:
         self.renders_dir = RENDERS_DIR
         self.assets_dir = ASSETS_DIR
 
-    def _ensure_badge_png(self) -> Path:
-        """Generates or loads sleek GTA VI Vice City metallic glassmorphism corner badge"""
-        badge_path = self.assets_dir / "gta6_badge.png"
+    @staticmethod
+    def _strip_emojis(text: str) -> str:
+        """Removes color emojis and non-glyph pictographs that render as tofu boxes in Pillow TTF fonts."""
+        import re
+        cleaned = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\ufe00-\ufe0f\u200d]+", " ", str(text or ""))
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return cleaned
+
+    def _ensure_badge_png(self, game_label: str = "GTA VI") -> Path:
+        """Generates or loads sleek metallic glassmorphism corner badge for detected game"""
+        import re
+        clean_label = self._strip_emojis(game_label).upper() or "GTA VI"
+        safe_key = re.sub(r"[^a-z0-9]+", "_", clean_label.lower()).strip("_") or "gta_vi"
+        badge_path = self.assets_dir / f"badge_cover_{safe_key}.png"
         if badge_path.exists():
             return badge_path
         try:
             from PIL import Image, ImageDraw
-            w, h = 240, 52
+            font = _get_font(["impact.ttf", "Impact.ttf", "Arial Bold.ttf", "arialbd.ttf"], 26)
+            font_sub = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 13)
+            tmp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            lbl_box = tmp_draw.textbbox((0, 0), clean_label, font=font)
+            sub_text = "• 4K 60FPS"
+            sub_box = tmp_draw.textbbox((0, 0), sub_text, font=font_sub)
+            lbl_w = lbl_box[2] - lbl_box[0]
+            sub_w = sub_box[2] - sub_box[0]
+            w = max(230, 26 + lbl_w + 14 + sub_w + 20)
+            h = 52
             badge = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             draw = ImageDraw.Draw(badge)
             draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=12, fill=(18, 16, 28, 240), outline=(238, 77, 160, 200), width=2)
             draw.line([14, 10, 14, h - 10], fill=(238, 77, 160, 255), width=3)
-            font = _get_font(["impact.ttf", "Impact.ttf", "Arial Bold.ttf", "arialbd.ttf"], 26)
-            font_sub = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 13)
-            draw.text((26, 11), "GTA VI", fill=(255, 255, 255), font=font)
-            draw.text((115, 17), "• 4K 60FPS", fill=(0, 255, 230), font=font_sub)
+            draw.text((26, 11), clean_label, fill=(255, 255, 255), font=font)
+            draw.text((26 + lbl_w + 14, 17), sub_text, fill=(0, 255, 230), font=font_sub)
             badge.save(str(badge_path))
         except Exception as e:
             logger.warning(f"Could not generate badge PNG: {e}")
@@ -76,8 +105,8 @@ class VideoRenderer:
             # Frosted glass card with Vice City neon magenta outline
             draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=20, fill=(12, 10, 22, 225), outline=(238, 77, 160, 220), width=3)
 
-            # Category pill tag
-            tag_text = f"🔥 {category_tag.upper()}" if not category_tag.startswith("🔥") else category_tag.upper()
+            # Category pill tag (strip emojis cleanly so Pillow TTF fonts never render tofu boxes)
+            tag_text = self._strip_emojis(category_tag).upper() or "GAMEPLAY • HIGHLIGHT"
             font_tag = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 13)
 
             tag_bbox = draw.textbbox((0, 0), tag_text, font=font_tag)
@@ -85,19 +114,26 @@ class VideoRenderer:
             draw.rounded_rectangle([30, 14, 30 + tag_w, 42], radius=6, fill=(238, 77, 160, 50), outline=(238, 77, 160, 180), width=1)
             draw.text((42, 20), tag_text, fill=(255, 120, 200), font=font_tag)
 
-            # Main headline text (clean, uppercase, trimmed if needed)
-            headline = hook_text.strip().upper()
-            if not any(headline.endswith(p) for p in ("!", "?", ".", "🔥", "🚨")):
-                headline += " 🚨"
+            # Main headline text (clean, uppercase, fitted inside 880px card width)
+            headline = self._strip_emojis(hook_text).upper() or "HIGHLIGHT MOMENT!"
+            if not any(headline.endswith(p) for p in ("!", "?", ".")):
+                headline += "!"
 
-            # Dynamically choose font size so text never overflows 880px
+            max_text_w = w - 64
             font_size = 44
-            if len(headline) > 34:
-                font_size = 32
-            elif len(headline) > 28:
-                font_size = 38
-
             font_main = _get_font(["impact.ttf", "Impact.ttf", "arialbd.ttf"], font_size)
+            while font_size > 20:
+                font_main = _get_font(["impact.ttf", "Impact.ttf", "arialbd.ttf"], font_size)
+                hb = draw.textbbox((0, 0), headline, font=font_main)
+                if (hb[2] - hb[0]) <= max_text_w:
+                    break
+                font_size -= 2
+
+            # Truncate gracefully with ellipsis if still wider than banner at min font size
+            hb = draw.textbbox((0, 0), headline, font=font_main)
+            while (hb[2] - hb[0]) > max_text_w and len(headline) > 10:
+                headline = headline[:-4].rstrip() + "..."
+                hb = draw.textbbox((0, 0), headline, font=font_main)
 
             draw.text((32, 54 + (44 - font_size) // 2), headline, fill=(255, 255, 255), font=font_main)
             banner.save(str(banner_path))
@@ -116,6 +152,8 @@ class VideoRenderer:
         clip_id: str,
         watermark_corner: Optional[str] = None,
         topic_banner_path: Optional[Path] = None,
+        badge_label: str = "GTA VI",
+        topic_banner_y: int = 260,
         progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> Path:
         """
@@ -142,24 +180,28 @@ class VideoRenderer:
 
         filter_chain = []
 
-        # 0.5. Top Topic Headline Banner (centered in top blurred area at Y=260)
+        # 0.5. Top Topic Headline Banner (centered in top zone cleanly without covering streamer eyes)
         if topic_banner_path and topic_banner_path.exists():
             inputs.extend(["-i", str(topic_banner_path)])
             banner_idx = len(inputs) // 2 - 1
-            filter_chain.append(f"[{v_stream}][{banner_idx}:v]overlay=(W-w)/2:260[v_head]")
+            filter_chain.append(f"[{v_stream}][{banner_idx}:v]overlay=(W-w)/2:{int(topic_banner_y)}[v_head]")
             v_stream = "v_head"
-            logger.info("Overlaid top topic headline banner at (W-w)/2:260")
+            logger.info(f"Overlaid top topic headline banner at (W-w)/2:{int(topic_banner_y)}")
 
         # 1. Callout PNG overlay sticker has been removed per user requirement
         # (prevents temporary blue box popup during 0s-3.5s at the start of clips)
 
         # 1.5. Dynamic AI Watermark / Creator Tag Masker Badge
-        if watermark_corner and str(watermark_corner).lower() not in ("none", "null", ""):
-            badge_png = self._ensure_badge_png()
+        corner_norm = ""
+        if watermark_corner is not None:
+            raw_corner = getattr(watermark_corner, "value", str(watermark_corner))
+            corner_norm = str(raw_corner).split(".")[-1].strip().lower()
+        if corner_norm and corner_norm not in ("none", "null", ""):
+            badge_png = self._ensure_badge_png(badge_label)
             if badge_png.exists():
                 inputs.extend(["-i", str(badge_png)])
                 badge_idx = len(inputs) // 2 - 1
-                corner_key = str(watermark_corner).lower()
+                corner_key = corner_norm
                 # Canvas 1080x1920 with centered 16:9 gameplay (Y=656..1264)
                 if "bottom_right" in corner_key or corner_key == "br":
                     pos_expr = "W-w-20:1264-h-14"
@@ -178,9 +220,8 @@ class VideoRenderer:
 
         # 2. Burn-in styled ASS subtitles
         if ass_subtitles_path and ass_subtitles_path.exists():
-            # Escape path for FFmpeg filter
-            escaped_ass = str(ass_subtitles_path).replace("\\", "/").replace(":", "\\:")
-            filter_chain.append(f"[{v_stream}]ass='{escaped_ass}'[v_out]")
+            escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
+            filter_chain.append(f"[{v_stream}]ass={escaped_ass}[v_out]")
             v_stream = "v_out"
 
         # 3. Master audio to YouTube Shorts / Reels -14 LUFS standard
@@ -397,17 +438,19 @@ class VideoRenderer:
             # Left half (0..960): Base Game (centered 16:9 in 960x1080)
             # Right half (960..1920): GTA 6 (centered 16:9 in 960x1080)
             filter_chain.extend([
-                "[0:v]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_left]",
-                "[0:v]scale=960:540:force_original_aspect_ratio=decrease[fg_left]",
+                "[0:v]setpts=PTS-STARTPTS,fps=60,split=2[l_bg_in][l_fg_in]",
+                "[l_bg_in]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_left]",
+                "[l_fg_in]scale=960:540:force_original_aspect_ratio=decrease[fg_left]",
                 "[bg_left][fg_left]overlay=(W-w)/2:(H-h)/2[left_comp]",
                 "[left_comp][3:v]overlay=30:30[left_badged]",
 
-                "[1:v]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_right]",
-                "[1:v]scale=960:540:force_original_aspect_ratio=decrease[fg_right]",
+                "[1:v]setpts=PTS-STARTPTS,fps=60,split=2[r_bg_in][r_fg_in]",
+                "[r_bg_in]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_right]",
+                "[r_fg_in]scale=960:540:force_original_aspect_ratio=decrease[fg_right]",
                 "[bg_right][fg_right]overlay=(W-w)/2:(H-h)/2[right_comp]",
                 "[right_comp][4:v]overlay=W-w-30:30[right_badged]",
 
-                "[left_badged][right_badged]hstack=inputs=2[h_stacked]",
+                "[left_badged][right_badged]hstack=inputs=2:shortest=1[h_stacked]",
                 "[h_stacked][2:v]overlay=(W-w)/2:(H-h)/2[v_staged]"
             ])
             v_curr = "v_staged"
@@ -419,26 +462,28 @@ class VideoRenderer:
                 v_curr = "v_head"
 
             if ass_subtitles_path and ass_subtitles_path.exists():
-                escaped_ass = str(ass_subtitles_path).replace("\\", "/").replace(":", "\\:")
-                filter_chain.append(f"[{v_curr}]ass='{escaped_ass}'[v_subbed]")
+                escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
+                filter_chain.append(f"[{v_curr}]ass={escaped_ass}[v_subbed]")
                 v_curr = "v_subbed"
 
         else:
             # 9:16 Vertical Shorts: 1080x1920
-            # Top half (0..960): Base Game (1080x608 centered in 0..960)
-            # Bottom half (960..1920): GTA 6 (1080x608 centered in 960..1920)
+            # Top half (0..960): Base Game (1080x608 centered in 0..960, Y=176..784)
+            # Bottom half (960..1920): GTA 6 (1080x608 centered in 960..1920, Y=176..784 local)
             filter_chain.extend([
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_top]",
-                "[0:v]scale=1080:608:force_original_aspect_ratio=decrease[fg_top]",
+                "[0:v]setpts=PTS-STARTPTS,fps=60,split=2[t_bg_in][t_fg_in]",
+                "[t_bg_in]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_top]",
+                "[t_fg_in]scale=1080:608:force_original_aspect_ratio=decrease[fg_top]",
                 "[bg_top][fg_top]overlay=(W-w)/2:(H-h)/2[top_comp]",
-                "[top_comp][3:v]overlay=30:110[top_badged]",
+                "[top_comp][3:v]overlay=30:188[top_badged]",
 
-                "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_bot]",
-                "[1:v]scale=1080:608:force_original_aspect_ratio=decrease[fg_bot]",
+                "[1:v]setpts=PTS-STARTPTS,fps=60,split=2[b_bg_in][b_fg_in]",
+                "[b_bg_in]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_bot]",
+                "[b_fg_in]scale=1080:608:force_original_aspect_ratio=decrease[fg_bot]",
                 "[bg_bot][fg_bot]overlay=(W-w)/2:(H-h)/2[bot_comp]",
-                "[bot_comp][4:v]overlay=30:70[bot_badged]",
+                "[bot_comp][4:v]overlay=30:188[bot_badged]",
 
-                "[top_badged][bot_badged]vstack=inputs=2[v_stacked]",
+                "[top_badged][bot_badged]vstack=inputs=2:shortest=1[v_stacked]",
                 "[v_stacked][2:v]overlay=(W-w)/2:960-(h/2)[v_staged]"
             ])
             v_curr = "v_staged"
@@ -450,8 +495,8 @@ class VideoRenderer:
                 v_curr = "v_head"
 
             if ass_subtitles_path and ass_subtitles_path.exists():
-                escaped_ass = str(ass_subtitles_path).replace("\\", "/").replace(":", "\\:")
-                filter_chain.append(f"[{v_curr}]ass='{escaped_ass}'[v_subbed]")
+                escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
+                filter_chain.append(f"[{v_curr}]ass={escaped_ass}[v_subbed]")
                 v_curr = "v_subbed"
 
         filter_chain.append("[5:a]loudnorm=I=-14:LRA=11:TP=-1.5[a_master]")

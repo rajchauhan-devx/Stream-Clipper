@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ------------------------------------------------------------------------------
 # Enums
@@ -28,6 +28,10 @@ class VoiceoverPacing(str, Enum):
     HOOK_ONLY = "hook_only"
     FULL_COMMENTARY = "full_commentary"
 
+class VideoFormat(str, Enum):
+    HIGHLIGHT = "highlight"
+    EXPLAINER = "explainer"
+
 class LongVideoStrategy(str, Enum):
     SEGMENT_HOPPER = "segment_hopper"
     FULL_VOD_BATCH = "full_vod_batch"
@@ -40,10 +44,26 @@ class WatermarkCorner(str, Enum):
     TOP_RIGHT = "top_right"
     TOP_LEFT = "top_left"
 
+class CreatorOverlayRegion(BaseModel):
+    kind: str = Field(description="facecam, channel_logo, or creator_text; never ordinary game HUD")
+    label: str = ""
+    x: float = Field(ge=0, le=1, allow_inf_nan=False, description="Left edge as fraction of original source width")
+    y: float = Field(ge=0, le=1, allow_inf_nan=False, description="Top edge as fraction of original source height")
+    width: float = Field(ge=0, le=1, allow_inf_nan=False)
+    height: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def inside_source(self):
+        if self.width <= 0 or self.height <= 0 or self.x + self.width > 1.001 or self.y + self.height > 1.001:
+            raise ValueError("Creator overlay rectangle extends outside the source frame")
+        return self
+
+
 class WatermarkInfo(BaseModel):
     detected: bool = Field(default=False, description="Whether a third-party channel name, watermark, or streamer cam is detected")
     label: Optional[str] = Field(default=None, description="The detected watermark text or handle (e.g. MKIceAndFire)")
     corner: WatermarkCorner = Field(default=WatermarkCorner.NONE, description="Corner location: bottom_right, bottom_left, top_right, top_left, or none")
+    regions: List[CreatorOverlayRegion] = Field(default_factory=list, description="All creator overlay rectangles in normalized ORIGINAL source coordinates; include full facecam box and every separate creator logo/name")
 
 class JobStatus(str, Enum):
     PENDING = "pending"
@@ -89,10 +109,14 @@ class StoryBeat(BaseModel):
     start_time: float = Field(..., description="Start timestamp in seconds from raw video")
     duration: float = Field(..., description="Duration of this beat in seconds (typically 5s-14s)")
     description: Optional[str] = Field(default="", description="What happens visually in this beat")
+    narration: str = Field(default="", description="Explainer commentary spoken during this scene")
+    role: str = Field(default="", description="Editorial purpose: context, development, detail, or conclusion")
+    evidence_id: str = Field(default="", description="Source observation supporting this explainer scene")
 
 class ClipBlueprint(BaseModel):
     clip_id: str = Field(..., description="Unique clip identifier (e.g., clip_1)")
     clip_type: str = Field(default="story_montage", description="'story_montage' for multi-beat narrative arc or 'single_moment' for continuous action")
+    video_format: VideoFormat = VideoFormat.HIGHLIGHT
     start_time: float = Field(..., description="Start timestamp in seconds from raw video (or first beat start)")
     end_time: float = Field(..., description="End timestamp in seconds from raw video")
     duration: float = Field(..., description="Total combined duration in seconds (typically 30s-55s)")
@@ -117,6 +141,31 @@ class ClipBlueprint(BaseModel):
     rendered_video_path: Optional[str] = Field(default=None, description="Local path to final 1080x1920 MP4")
     preview_url: Optional[str] = Field(default=None, description="Static URL to stream preview in Studio UI")
     status: str = Field(default="ready", description="Clip status: ready, rendering, rendered, error")
+    verification_passed: bool = Field(default=False, description="True if verified and frame-trimmed via 5 FPS close-up pass")
+    verification_notes: Optional[str] = Field(default=None, description="Notes from close-up visual & audio verification pass")
+    narration_language: str = Field(default="", description="Language of verified narration; blank for legacy clips requiring migration")
+
+
+class BeatTrim(BaseModel):
+    beat_id: str = Field(..., description="Identifier of the beat being trimmed")
+    trim_start_offset: float = Field(..., ge=0.0, description="Trimmed start offset in seconds relative to this beat's micro-clip")
+    trim_end_offset: float = Field(..., ge=0.0, description="Trimmed end offset in seconds relative to this beat's micro-clip")
+    approved: bool = Field(default=True, description="Whether this beat shows clear action/payoff without dead air or menus")
+    notes: Optional[str] = Field(default=None, description="What happens in this beat visually and audibly")
+
+
+class ClipVerificationResult(BaseModel):
+    approved: bool = Field(..., description="True if candidate delivers engaging pure gameplay with clear hook/payoff")
+    quality_score: int = Field(..., ge=1, le=100, description="Close-up editorial retention score 1-100")
+    trim_start_offset: float = Field(default=0.0, ge=0.0, description="Start offset in seconds relative to micro-clip start (for single_moment)")
+    trim_end_offset: float = Field(default=0.0, ge=0.0, description="End offset in seconds relative to micro-clip start (for single_moment)")
+    beat_trims: List[BeatTrim] = Field(default_factory=list, description="Per-beat trim adjustments (for story_montage)")
+    verified_hook_text: Optional[str] = Field(default=None, description="Crisp 3-6 word uppercase title grounded strictly in what happens in these verified 5-FPS frames (no emojis needed)")
+    verified_script: Optional[str] = Field(default=None, description="Voiceover narration rewritten strictly around what visibly and audibly occurs in the verified trimmed frames, sized to match the verified duration")
+    has_third_party_overlay: Optional[bool] = Field(default=None, description="True ONLY if an actual channel logo/handle watermark or streamer facecam box appears; false for clean game HUD")
+    focus_hint: Optional[str] = Field(default=None, description="Visual focus area or detail worth highlighting")
+    verdict: str = Field(..., description="Concise editorial justification based on close-up frames & audio")
+
 
 class DirectorPlan(BaseModel):
     source_title: str = Field(..., description="Title of the input gameplay video")
@@ -126,6 +175,7 @@ class DirectorPlan(BaseModel):
     detected_radio_songs: List[str] = Field(default_factory=list, description="All copyrighted tracks detected")
     overall_analysis: str = Field(..., description="Gemini Vision director notes on gameplay pace and highlights")
     clips: List[ClipBlueprint] = Field(..., min_length=1, description="List of generated clip blueprints")
+    candidate_pool: List[ClipBlueprint] = Field(default_factory=list, description="Additional scouted backup candidates ranked during close-up verification")
 
 # ------------------------------------------------------------------------------
 # Request & Progress Schemas
@@ -133,7 +183,9 @@ class DirectorPlan(BaseModel):
 class CreateJobRequest(BaseModel):
     url_or_path: str = Field(..., description="YouTube URL or local file path to raw MP4")
     mode: OperatingMode = Field(default=OperatingMode.AUTO_PILOT, description="Execution mode")
-    target_language: TargetLanguage = Field(default=TargetLanguage.HINGLISH, description="Commentary language")
+    video_format: VideoFormat = VideoFormat.HIGHLIGHT
+    explainer_topic: str = Field(default="", max_length=300, description="Optional topic to look for; blank discovers interesting stories")
+    target_language: TargetLanguage = Field(default=TargetLanguage.ENGLISH, description="English narration; legacy Hindi/Hinglish requests normalize to English")
     clip_length_range: str = Field(default="30s-55s", description="Target clip length (e.g. 30s-55s)")
     clip_count: int = Field(default=3, ge=1, le=10, description="Number of viral clips to extract")
     copyright_guard: bool = Field(default=True, description="Strip in-game GTA radio music via Demucs")
@@ -141,14 +193,24 @@ class CreateJobRequest(BaseModel):
     voiceover_pacing: VoiceoverPacing = Field(default=VoiceoverPacing.FULL_COMMENTARY, description="Voiceover style: hook_only (3-6s) or full_commentary")
     tts_voice: str = Field(default="Charon", description="Preferred TTS voice persona: Charon (cinematic storytelling), Aoede (smooth female), Kore (calm female), Fenrir (commanding male), Puck (energetic)")
     caption_style: CaptionStyle = Field(default=CaptionStyle.HORMOZI_YELLOW, description="Default caption style")
+    crop_mode: Optional[CropMode] = Field(default=None, description="Vertical framing preset: center_zoom, facecam_split, or action_track")
     enable_callout_overlay: bool = Field(default=False, description="Burn in top meme callout sticker overlay (default: False for clean gameplay)")
-    enable_watermark_masker: bool = Field(default=True, description="AI-supervised watermark detection & dynamic GTA VI badge cover")
+    enable_watermark_masker: bool = Field(default=True, description="Audit and hide creator facecams, logos and names before framing")
     enable_topic_header: bool = Field(default=True, description="Render attractive topic headline banner in top blurred zone")
     cut_start_time: str = Field(default="00:00:00", description="Start timestamp for video cutter (HH:MM:SS or MM:SS)")
     cut_duration_mins: Optional[float] = Field(default=20.0, description="Duration in minutes to cut and analyze with Gemini (1 to 60 mins)")
     auto_cut_long_videos: bool = Field(default=True, description="Automatically cuts videos longer than 60 mins into safe segments under Gemini's token limit")
     long_video_strategy: LongVideoStrategy = Field(default=LongVideoStrategy.SEGMENT_HOPPER, description="Strategy for long videos: segment_hopper, full_vod_batch, or energy_peaks")
     game_volume_boost: float = Field(default=1.5, description="Audio boost multiplier for in-game sound effects (1.0 = Normal, 1.5 = Boosted SFX, 2.0 = High Impact)")
+    enable_closeup_verify: bool = Field(default=True, description="Run Stage 3 5-FPS close-up verification & frame-accurate trimming on scouted candidates")
+
+    @model_validator(mode="after")
+    def enforce_explainer_requirements(self):
+        self.target_language = TargetLanguage.ENGLISH
+        if self.video_format == VideoFormat.EXPLAINER:
+            self.voiceover_pacing = VoiceoverPacing.FULL_COMMENTARY
+            self.enable_closeup_verify = True
+        return self
 
 class UpdateClipRequest(BaseModel):
     commentary_script: Optional[str] = None
@@ -159,6 +221,7 @@ class UpdateClipRequest(BaseModel):
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     overlay_prompt: Optional[str] = None
+    social_metadata: Optional[SocialMetadata] = None
 
 class JobProgressUpdate(BaseModel):
     job_id: str
@@ -258,9 +321,14 @@ class ComparisonQuest(BaseModel):
 class ComparisonQuestRequest(BaseModel):
     gta6_url_or_path: str
     base_game: ComparisonGame = ComparisonGame.GTA5
-    target_language: TargetLanguage = TargetLanguage.HINGLISH
+    target_language: TargetLanguage = TargetLanguage.ENGLISH
     start_time: str = "00:00:00"
     duration_sec: float = 20.0
+
+    @model_validator(mode="after")
+    def english_only(self):
+        self.target_language = TargetLanguage.ENGLISH
+        return self
 
 class ComparisonRenderRequest(BaseModel):
     quest_id: Optional[str] = None

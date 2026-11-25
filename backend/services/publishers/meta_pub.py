@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
 
-from backend.config import META_ACCESS_TOKEN, META_PAGE_ID, INSTAGRAM_ACCOUNT_ID, PUBLIC_TUNNEL_URL
+import backend.config as app_config
 
 logger = logging.getLogger("gta6-studio.publisher.meta")
 
@@ -14,13 +14,19 @@ GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 class MetaPublisher:
     def __init__(self):
-        self.access_token = META_ACCESS_TOKEN
-        self.page_id = META_PAGE_ID
-        self.ig_account_id = INSTAGRAM_ACCOUNT_ID
-        self.tunnel_url = PUBLIC_TUNNEL_URL
+        self.access_token = app_config.META_ACCESS_TOKEN
+        self.page_id = app_config.META_PAGE_ID
+        self.ig_account_id = app_config.INSTAGRAM_ACCOUNT_ID
+        self.tunnel_url = app_config.PUBLIC_TUNNEL_URL
+
+    def reload_config(self) -> None:
+        self.access_token = app_config.META_ACCESS_TOKEN
+        self.page_id = app_config.META_PAGE_ID
+        self.ig_account_id = app_config.INSTAGRAM_ACCOUNT_ID
+        self.tunnel_url = app_config.PUBLIC_TUNNEL_URL
 
     def _ensure_credentials(self, platform_name: str):
-        token = self.access_token or os.getenv("META_ACCESS_TOKEN")
+        token = app_config.META_ACCESS_TOKEN or self.access_token or os.getenv("META_ACCESS_TOKEN")
         if not token:
             raise ValueError(
                 f"Meta Access Token not configured for {platform_name}. "
@@ -64,7 +70,7 @@ class MetaPublisher:
         init_res = requests.post(init_url, data={
             "upload_phase": "start",
             "access_token": token
-        })
+        }, timeout=30)
         if init_res.status_code != 200:
             raise RuntimeError(f"FB Reels Init Failed: {init_res.text}")
 
@@ -80,7 +86,7 @@ class MetaPublisher:
                 "offset": "0",
                 "file_size": str(file_size)
             }
-            upload_res = requests.post(upload_url, data=f, headers=headers)
+            upload_res = requests.post(upload_url, data=f, headers=headers, timeout=300)
             if upload_res.status_code not in [200, 201]:
                 raise RuntimeError(f"FB Reels Binary Upload Failed: {upload_res.text}")
 
@@ -101,7 +107,7 @@ class MetaPublisher:
         else:
             finish_payload["video_state"] = "PUBLISHED"
 
-        finish_res = requests.post(init_url, data=finish_payload)
+        finish_res = requests.post(init_url, data=finish_payload, timeout=30)
         if finish_res.status_code != 200:
             raise RuntimeError(f"FB Reels Finish Failed: {finish_res.text}")
 
@@ -159,7 +165,7 @@ class MetaPublisher:
             "video_url": full_video_url,
             "caption": full_caption[:2200],
             "access_token": token
-        })
+        }, timeout=30)
         if c_res.status_code != 200:
             raise RuntimeError(f"Instagram Container Creation Failed: {c_res.text}")
 
@@ -171,7 +177,7 @@ class MetaPublisher:
         is_ready = False
         for _ in range(max_retries):
             time.sleep(3)
-            s_res = requests.get(status_url, params={"fields": "status_code", "access_token": token})
+            s_res = requests.get(status_url, params={"fields": "status_code", "access_token": token}, timeout=30)
             if s_res.status_code == 200:
                 sc = s_res.json().get("status_code")
                 if sc == "FINISHED":
@@ -188,7 +194,7 @@ class MetaPublisher:
         p_res = requests.post(publish_url, data={
             "creation_id": container_id,
             "access_token": token
-        })
+        }, timeout=30)
         if p_res.status_code != 200:
             raise RuntimeError(f"Instagram Media Publish Failed: {p_res.text}")
 

@@ -39,6 +39,10 @@ class CaptionerService:
         audio_path: Path,
         output_ass_path: Path,
         style: CaptionStyle = CaptionStyle.HORMOZI_YELLOW,
+        target_language: str = "english",
+        initial_prompt: Optional[str] = None,
+        play_res_x: int = 1080,
+        play_res_y: int = 1920,
         progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> Path:
         """
@@ -48,22 +52,31 @@ class CaptionerService:
         if progress_callback:
             progress_callback(45, "Generating word-level ASS captions with active highlighting...")
 
-        logger.info(f"Generating captions from {audio_path} in style {style.value}...")
+        logger.info(f"Generating captions from {audio_path} in style {style.value} (lang={target_language})...")
         model = self._get_whisper()
+
+        lang_key = str(target_language or "english").lower()
+        whisper_lang: Optional[str] = "hi" if lang_key == "hindi" else "en"
+
+        transcribe_kwargs: Dict[str, Any] = {
+            "word_timestamps": True,
+            "vad_filter": True,
+            "language": whisper_lang,
+        }
+        if initial_prompt and initial_prompt.strip():
+            transcribe_kwargs["initial_prompt"] = initial_prompt.strip()[:400]
 
         # Word-level timestamp extraction
         segments, _ = model.transcribe(
             str(audio_path),
-            word_timestamps=True,
-            vad_filter=True,
-            language="en"
+            **transcribe_kwargs
         )
 
         words_data: List[Dict[str, Any]] = []
         for segment in segments:
             if segment.words:
                 for w in segment.words:
-                    clean_word = w.word.strip().upper()
+                    clean_word = w.word.strip().upper().replace("{", "").replace("}", "").replace("\n", " ")
                     if clean_word:
                         words_data.append({
                             "word": clean_word,
@@ -103,15 +116,24 @@ class CaptionerService:
             outline_color = "&H00000000"
             font_size = 68
 
+        is_landscape = play_res_x > play_res_y
+        if is_landscape:
+            font_size = max(44, font_size - 16)
+            margin_v = 110
+            margin_x = 120
+        else:
+            margin_v = 220
+            margin_x = 60
+
         ass_header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Impact,{font_size},{primary_color},&H000000FF,{outline_color},&H80000000,-1,0,0,0,100,100,2,0,1,6,3,2,60,60,220,1
+Style: Default,Impact,{font_size},{primary_color},&H000000FF,{outline_color},&H80000000,-1,0,0,0,100,100,2,0,1,6,3,2,{margin_x},{margin_x},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -124,9 +146,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for i in range(0, len(words_data), chunk_size):
             chunk = words_data[i:i + chunk_size]
             for target_idx, active_word in enumerate(chunk):
-                start_str = self._format_ass_time(active_word["start"])
-                # Extend end slightly so words don't flicker/gap
-                end_str = self._format_ass_time(active_word["end"] + 0.1)
+                global_idx = i + target_idx
+                start_sec = float(active_word["start"])
+                end_sec = float(active_word["end"]) + 0.1
+                if global_idx + 1 < len(words_data):
+                    next_start = float(words_data[global_idx + 1]["start"])
+                    if next_start > start_sec:
+                        end_sec = min(end_sec, next_start)
+                if end_sec <= start_sec:
+                    end_sec = start_sec + 0.05
+
+                start_str = self._format_ass_time(start_sec)
+                end_str = self._format_ass_time(end_sec)
 
                 # Build line where only active_word has highlight color
                 text_parts = []

@@ -44,15 +44,19 @@ def get_python_executable():
 
 def get_node_package_manager():
     """Detect pnpm or npm"""
-    # Check custom nvm path first if on mac
-    nvm_pnpm = Path("/Users/laheri/.nvm/versions/node/v20.20.1/bin/pnpm")
-    if nvm_pnpm.exists():
-        return str(nvm_pnpm)
-
     for cmd in ["pnpm", "npm", "yarn"]:
         resolved = shutil.which(cmd)
         if resolved:
             return resolved
+
+    # Fallback: scan nvm versions on macOS/Linux if PATH doesn't include node
+    nvm_versions = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_versions.exists():
+        for bin_name in ["pnpm", "npm"]:
+            matches = sorted(nvm_versions.glob(f"*/bin/{bin_name}"), reverse=True)
+            if matches:
+                return str(matches[0])
+
     return "npm"
 
 def wait_for_port(url, max_retries=30, delay=0.5):
@@ -113,7 +117,8 @@ def main():
             "backend.main:app",
             "--host", "127.0.0.1",
             "--port", "8000",
-            "--reload"
+            "--reload",
+            "--reload-dir", "backend",
         ]
         backend_proc = subprocess.Popen(
             backend_cmd,

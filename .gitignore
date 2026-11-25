@@ -33,6 +33,7 @@ client_secret.json
 token.json
 youtube_token.json
 workspace/jobs_db.json
+workspace/comparisons_db.json
 
 # OS Specific
 .DS_Store

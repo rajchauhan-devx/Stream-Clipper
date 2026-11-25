@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import subprocess
 import logging
@@ -30,6 +31,13 @@ def parse_time_str(time_str: Any) -> float:
     except ValueError:
         pass
     return 0.0
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    """Extracts the 11-character YouTube video ID from watch, youtu.be, or shorts URLs."""
+    import re
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})", str(url or ""))
+    return m.group(1) if m else None
+
 
 class IngestService:
     def __init__(self):
@@ -90,7 +98,7 @@ class IngestService:
             logger.info(f"Using local video file: {candidate_local}")
             # If on the same filesystem, we can symlink or copy
             if candidate_local != output_raw_path:
-                shutil.copy2(candidate_local, output_raw_path)
+                self._link_or_copy(candidate_local, output_raw_path)
 
             meta = self._get_video_metadata(output_raw_path)
             meta["title"] = candidate_local.stem
@@ -98,23 +106,32 @@ class IngestService:
             meta["is_local"] = True
             return meta
 
-        # Case 2: Check URL cache for previously downloaded online VOD
+        # Case 2: Check URL cache for previously downloaded online VOD (exact URL or YouTube ID)
         cache_index_file = self.downloads_dir / "url_cache.json"
-        url_cache = {}
+        url_cache: Dict[str, Any] = {}
         if cache_index_file.exists():
             try:
-                url_cache = json.loads(cache_index_file.read_text())
-            except Exception:
-                pass
+                url_cache = json.loads(cache_index_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(f"Could not read URL cache index: {exc}")
 
-        cached_file_str = url_cache.get(url_or_path)
-        # Also auto-detect if the YouTube ID matches an existing raw file
-        if not cached_file_str:
-            for cand in self.downloads_dir.glob("*_raw.mp4"):
-                if cand.stat().st_size > 50 * 1024 * 1024:
-                    if ("-D_wt4GXmNw" in url_or_path and "job_c26457e4" in cand.name):
-                        cached_file_str = str(cand)
-                        break
+        yt_id = _extract_youtube_id(url_or_path)
+        yt_cache_key = f"yt:{yt_id}" if yt_id else None
+        cached_entry = url_cache.get(url_or_path) or (url_cache.get(yt_cache_key) if yt_cache_key else None)
+        if not cached_entry and yt_id:
+            for k, v in url_cache.items():
+                if _extract_youtube_id(k) == yt_id:
+                    cached_entry = v
+                    break
+        cached_file_str = None
+        cached_title = None
+        cached_duration = None
+        if isinstance(cached_entry, dict):
+            cached_file_str = cached_entry.get("raw_path")
+            cached_title = cached_entry.get("title")
+            cached_duration = cached_entry.get("duration")
+        elif isinstance(cached_entry, str):
+            cached_file_str = cached_entry
 
         if cached_file_str:
             cached_path = Path(cached_file_str)
@@ -122,9 +139,12 @@ class IngestService:
                 if progress_callback:
                     progress_callback(25, f"Using fast cached 1080p stream ({cached_path.name})...")
                 logger.info(f"Reusing cached raw video for {url_or_path}: {cached_path}")
-                shutil.copy2(cached_path, output_raw_path)
+                if cached_path.resolve() != output_raw_path.resolve():
+                    self._link_or_copy(cached_path, output_raw_path)
                 meta = self._get_video_metadata(output_raw_path)
-                meta["title"] = "GTA 6 Gameplay Walkthrough Part 3 (No Commentary)"
+                meta["title"] = cached_title or cached_path.stem
+                if cached_duration and float(cached_duration) > 0:
+                    meta["duration"] = float(cached_duration)
                 meta["raw_path"] = str(output_raw_path)
                 meta["is_local"] = False
                 return meta
@@ -182,6 +202,8 @@ class IngestService:
             'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             'outtmpl': str(self.downloads_dir / f"{job_id}_raw.%(ext)s"),
             'merge_output_format': 'mp4',
+            'concurrent_fragment_downloads': 8,
+            'http_chunk_size': 10485760,
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [ytdl_hook],
@@ -235,10 +257,17 @@ class IngestService:
         meta["raw_path"] = str(output_raw_path)
         meta["is_local"] = False
         try:
-            url_cache[url_or_path] = str(output_raw_path)
-            cache_index_file.write_text(json.dumps(url_cache, indent=2))
-        except Exception:
-            pass
+            cache_record = {
+                "raw_path": str(output_raw_path),
+                "title": meta["title"],
+                "duration": meta["duration"],
+            }
+            url_cache[url_or_path] = cache_record
+            if yt_cache_key:
+                url_cache[yt_cache_key] = cache_record
+            cache_index_file.write_text(json.dumps(url_cache, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"Failed to update URL cache: {exc}")
         return meta
 
     def cut_video_segment(
@@ -412,6 +441,196 @@ class IngestService:
             logger.warning(f"Audio energy peak scan fallback: {e}")
             return 0.0
 
+    @staticmethod
+    def _link_or_copy(src: Path, dst: Path) -> None:
+        """Hardlinks src -> dst when on the same filesystem, falling back to shutil.copy2."""
+        if src.resolve() == dst.resolve():
+            return
+        if dst.exists():
+            dst.unlink(missing_ok=True)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
+    @staticmethod
+    def _has_audio_stream(video_path: Path) -> bool:
+        """Returns True if the media file contains at least one audio stream."""
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_type",
+                    "-of", "csv=p=0",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return "audio" in (probe.stdout or "").lower()
+        except Exception:
+            return False
+
+    def extract_timeline_signals(
+        self,
+        video_path: str | Path,
+        max_duration_sec: float = 3600.0,
+        progress_callback: Optional[Callable[[int, str], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Stage 1 Signal Pre-Indexer:
+        Extracts 2-second audio RMS energy spikes and hard visual scene-cut timestamps
+        so Gemini receives concrete anchor points alongside the proxy video.
+        """
+        src = Path(video_path)
+        if not src.exists():
+            return {"duration": 0.0, "audio_peaks": [], "scene_cuts": []}
+
+        if progress_callback:
+            progress_callback(31, "Scanning audio energy spikes & scene cuts for cue sheet...")
+
+        meta = self._get_video_metadata(src)
+        total_duration = float(meta.get("duration", 0.0))
+        scan_len = min(total_duration, max_duration_sec) if total_duration > 0 else max_duration_sec
+
+        audio_peaks: list[Dict[str, float]] = []
+        if self._has_audio_stream(src):
+            try:
+                import numpy as np
+                cmd = [
+                    "ffmpeg", "-y", "-ss", "0", "-t", str(scan_len),
+                    "-i", str(src),
+                    "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1",
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                raw_bytes, _ = proc.communicate(timeout=45)
+                if raw_bytes:
+                    samples = np.frombuffer(raw_bytes, dtype=np.int16)
+                    block_size = 8000 * 2  # 2-second buckets
+                    num_blocks = len(samples) // block_size
+                    energies = []
+                    for i in range(num_blocks):
+                        blk = samples[i * block_size : (i + 1) * block_size].astype(np.float32)
+                        energies.append((i * 2.0, float(np.sqrt(np.mean(blk ** 2)))))
+                    if energies:
+                        vals = [e[1] for e in energies]
+                        mean_rms = float(np.mean(vals))
+                        std_rms = float(np.std(vals))
+                        threshold = mean_rms + 0.8 * std_rms
+                        # Pick local maxima spaced at least 8s apart
+                        ranked = sorted((e for e in energies if e[1] >= threshold), key=lambda x: x[1], reverse=True)
+                        chosen: list[tuple[float, float]] = []
+                        for ts, rms in ranked:
+                            if all(abs(ts - c_ts) >= 8.0 for c_ts, _ in chosen):
+                                chosen.append((ts, rms))
+                            if len(chosen) >= 25:
+                                break
+                        audio_peaks = [
+                            {"time_sec": round(ts, 1), "rms": round(rms, 1)}
+                            for ts, rms in sorted(chosen, key=lambda x: x[0])
+                        ]
+            except Exception as e:
+                logger.warning(f"Timeline audio signal scan failed: {e}")
+
+        scene_cuts: list[float] = []
+        try:
+            sc_proc = subprocess.run(
+                [
+                    "ffmpeg", "-ss", "0", "-t", str(scan_len),
+                    "-i", str(src),
+                    "-vf", "fps=2,select='gt(scene,0.32)',showinfo",
+                    "-f", "null", "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            for line in (sc_proc.stderr or "").splitlines():
+                if "pts_time:" in line:
+                    for part in line.split():
+                        if part.startswith("pts_time:"):
+                            try:
+                                t_val = round(float(part.split(":")[1]), 2)
+                                if not scene_cuts or (t_val - scene_cuts[-1]) >= 2.0:
+                                    scene_cuts.append(t_val)
+                            except ValueError:
+                                pass
+            scene_cuts = scene_cuts[:40]
+        except Exception as e:
+            logger.warning(f"Timeline scene-cut scan failed: {e}")
+
+        logger.info(
+            f"Signal scan complete: {len(audio_peaks)} audio peaks, {len(scene_cuts)} scene cuts"
+        )
+        return {
+            "duration": total_duration,
+            "audio_peaks": audio_peaks,
+            "scene_cuts": scene_cuts,
+        }
+
+    def create_micro_verification_clip(
+        self,
+        source_video_path: str | Path,
+        start_sec: float,
+        duration_sec: float,
+        output_path: str | Path,
+        fps: float = 5.0,
+    ) -> Path:
+        """
+        Stage 3 Close-Up Micro-Clip:
+        Cuts a focused 5 FPS, 480p/720p + low-bitrate audio clip around a candidate moment
+        with relative offset timestamps (+00.0s) burned into the corner so Gemini can verify
+        action, hear dialogue/SFX, and trim boundaries with ~0.2s accuracy.
+        """
+        src = Path(source_video_path)
+        out = Path(output_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Source video missing for verification clip: {src}")
+
+        has_audio = self._has_audio_stream(src)
+        vf_filter = (
+            f"fps={fps},scale=-2:480,"
+            "drawtext=text='t=+%{pts\\:flt}s':x=14:y=14:fontsize=24:"
+            "fontcolor=yellow:box=1:boxcolor=black@0.75"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(max(0.0, float(start_sec))),
+            "-t", str(max(1.0, float(duration_sec))),
+            "-i", str(src),
+            "-vf", vf_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+        ]
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", "16000"])
+        else:
+            cmd.append("-an")
+        cmd.append(str(out))
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0 or not out.exists() or out.stat().st_size < 500:
+            # Retry without drawtext in case system font/filter fails
+            fallback_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(max(0.0, float(start_sec))),
+                "-t", str(max(1.0, float(duration_sec))),
+                "-i", str(src),
+                "-vf", f"fps={fps},scale=-2:480",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            ]
+            if has_audio:
+                fallback_cmd.extend(["-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", "16000"])
+            else:
+                fallback_cmd.append("-an")
+            fallback_cmd.append(str(out))
+            subprocess.run(fallback_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return out
+
     def create_lightweight_proxy(
         self,
         raw_video_path: str,
@@ -419,9 +638,8 @@ class IngestService:
         progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> Path:
         """
-        Creates ultra-lightweight 480p @ 1 FPS proxy video:
-        (scale=-2:480, fps=1)
-        Reduces token usage by >95% and uploads to Gemini API in 2-3 seconds.
+        Creates lightweight 480p @ 1 FPS (or 0.5 FPS >30m) proxy video WITH low-bitrate mono audio
+        so Gemini Vision can both SEE gameplay and HEAR dialogue, sirens, gunfire, and reactions.
         """
         raw_path = Path(raw_video_path)
         if not raw_path.exists():
@@ -431,63 +649,79 @@ class IngestService:
 
         meta = self._get_video_metadata(raw_path)
         total_duration = meta.get("duration", 60.0)
+        has_audio = self._has_audio_stream(raw_path)
 
         # Dynamic Adaptive FPS:
         # If duration <= 1800s (30m): 1 FPS (max 1800 frames = ~460k tokens)
         # If duration > 1800s (up to 3600s / 60m): 0.5 FPS (1 frame every 2s -> max 1800 frames = ~460k tokens)
-        # Guarantees that even a full 60-minute video NEVER exceeds 1,800 frames or 470k tokens!
         fps_val = 1.0 if total_duration <= 1800.0 else 0.5
         total_frames = max(1, int(total_duration * fps_val))
 
         if progress_callback:
-            progress_callback(31, f"Encoding 480p @ {fps_val} FPS proxy (0/{total_frames} frames)...")
+            progress_callback(31, f"Encoding 480p @ {fps_val} FPS audio-enabled proxy (0/{total_frames} frames)...")
 
-        logger.info(f"Creating 480p @ {fps_val} FPS proxy from {raw_path} -> {proxy_path} (Total frames: {total_frames})")
+        logger.info(f"Creating 480p @ {fps_val} FPS proxy (audio={has_audio}) from {raw_path} -> {proxy_path} (Total frames: {total_frames})")
 
-        # FFmpeg command: scale height to 480 (maintaining aspect ratio), adaptive FPS, no audio, fast encode
+        # Keep proxy comfortably under 18MB for inline Vertex AI while preserving 1 FPS & mono audio
+        target_v_kbps = max(45, min(140, int((13.0 * 8192) / max(60.0, total_duration)) - 24))
         cmd = [
             "ffmpeg", "-y",
             "-i", str(raw_path),
             "-vf", f"scale=-2:480,fps={fps_val}",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-an",
-            "-progress", "pipe:1",
-            str(proxy_path)
+            "-preset", "veryfast",
+            "-crf", "30",
+            "-maxrate", f"{target_v_kbps}k",
+            "-bufsize", f"{target_v_kbps * 2}k",
         ]
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "24k", "-ac", "1", "-ar", "16000"])
+        else:
+            cmd.append("-an")
+        cmd.extend(["-progress", "pipe:1", str(proxy_path)])
 
         import time
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            universal_newlines=True
-        )
+        err_log_path = self.temp_dir / f"{job_id}_proxy_ffmpeg.log"
+        err_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(err_log_path, "w", encoding="utf-8") as err_f:
+            with subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=err_f,
+                universal_newlines=True
+            ) as proc:
+                last_update = 0.0
+                if proc.stdout:
+                    for line in proc.stdout:
+                        line = line.strip()
+                        if line.startswith("frame="):
+                            try:
+                                curr_frame = int(line.split("=")[1].strip())
+                                now = time.time()
+                                if now - last_update >= 0.25:
+                                    last_update = now
+                                    progress_frac = min(1.0, curr_frame / total_frames)
+                                    mapped_pct = min(50, int(31 + (progress_frac * 19)))
+                                    pct_display = progress_frac * 100
+                                    if progress_callback:
+                                        progress_callback(
+                                            mapped_pct,
+                                            f"Encoding 480p proxy: {pct_display:.1f}% ({curr_frame}/{total_frames} frames)"
+                                        )
+                            except Exception:
+                                pass
+                proc.wait()
+                ret_code = proc.returncode
 
-        last_update = 0.0
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("frame="):
-                try:
-                    curr_frame = int(line.split("=")[1].strip())
-                    now = time.time()
-                    if now - last_update >= 0.25:
-                        last_update = now
-                        progress_frac = min(1.0, curr_frame / total_frames)
-                        mapped_pct = min(50, int(31 + (progress_frac * 19)))
-                        pct_display = progress_frac * 100
-                        if progress_callback:
-                            progress_callback(
-                                mapped_pct,
-                                f"Encoding 480p proxy: {pct_display:.1f}% ({curr_frame}/{total_frames} frames)"
-                            )
-                except Exception:
-                    pass
-
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError("FFmpeg 480p proxy encode failed")
+        stderr_tail = ""
+        try:
+            if err_log_path.exists():
+                stderr_tail = err_log_path.read_text(encoding="utf-8", errors="ignore")[-300:]
+                err_log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if ret_code != 0:
+            raise RuntimeError(f"FFmpeg 480p proxy encode failed: {stderr_tail}")
 
         proxy_size_mb = proxy_path.stat().st_size / (1024 * 1024)
         logger.info(f"Proxy created successfully: {proxy_path} ({proxy_size_mb:.2f} MB)")

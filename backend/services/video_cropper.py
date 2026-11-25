@@ -1,5 +1,8 @@
 import os
 import gc
+import math
+import hashlib
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -8,9 +11,35 @@ import cv2
 import numpy as np
 
 from backend.config import TEMP_DIR, HARDWARE
-from backend.schemas import CropMode
+from backend.schemas import CropMode, CreatorOverlayRegion
+from backend.services.creator_inpainter import creator_inpainter
 
 logger = logging.getLogger("gta6-studio.cropper")
+
+
+def creator_mask_rectangles(regions: List[CreatorOverlayRegion], width: int, height: int) -> List[Tuple[int, int, int, int]]:
+    """Source-coordinate reconstruction masks, including camera borders and antialiasing."""
+    rectangles = []
+    for item in regions:
+        region = CreatorOverlayRegion.model_validate(item)
+        x = max(0, math.floor(region.x * width) - 8)
+        y = max(0, math.floor(region.y * height) - 8)
+        right = min(width, math.ceil((region.x + region.width) * width) + 8)
+        bottom = min(height, math.ceil((region.y + region.height) * height) + 8)
+        if "cam" in region.kind:
+            # Corner cameras reach the source edge. Close small localization gaps so
+            # the outer camera strip cannot survive behind a seemingly complete cover.
+            if region.x <= .05:
+                x = 0
+            if region.y <= .05:
+                y = 0
+            if region.x + region.width >= .95:
+                right = width
+            if region.y + region.height >= .95:
+                bottom = height
+        rectangles.append((x, y, right-x, bottom-y))
+    return rectangles
+
 
 class VideoCropper:
     def __init__(self):
@@ -137,6 +166,7 @@ class VideoCropper:
             current_frame = 0
             max_frame = int(scan_duration * fps)
 
+            consecutive_hits = 0
             while current_frame < max_frame:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
                 ret, frame = cap.read()
@@ -151,18 +181,26 @@ class VideoCropper:
                     for b in boxes:
                         box_w, box_h = b[2], b[3]
                         box_area = (box_w * box_h) / (width * height)
-                        # Fullscreen streamer check: large person taking >20% of frame area,
-                        # >30% width, >40% height, and positioned centrally
-                        if box_area > 0.20 and box_w > (0.30 * width) and box_h > (0.40 * height):
+                        # Strict webcam talking-head threshold (>42% frame area & >55% height)
+                        # avoids false-positives on 3rd-person gameplay protagonists (~20-30% area).
+                        if box_area > 0.42 and box_w > (0.40 * width) and box_h > (0.55 * height):
                             has_fullscreen_human = True
                             break
 
                 sec = current_frame / fps
                 if has_fullscreen_human:
-                    intro_end_sec = sec + sample_interval_sec
-                elif intro_end_sec > 0 and (sec - intro_end_sec) > 6.0:
-                    # Gameplay confirmed for several consecutive checks
-                    break
+                    consecutive_hits += 1
+                    # Genuine streamer intros start in the opening ~16s and hold for >=6s (3+ hits)
+                    if consecutive_hits >= 3 and (sec - (consecutive_hits - 1) * sample_interval_sec) <= 16.0:
+                        intro_end_sec = sec + sample_interval_sec
+                else:
+                    consecutive_hits = 0
+                    if intro_end_sec > 0 and (sec - intro_end_sec) > 6.0:
+                        # Gameplay confirmed for several consecutive checks
+                        break
+                    if sec > 16.0 and intro_end_sec == 0.0:
+                        # No opening streamer intro found; avoid false-positives on later cutscene close-ups
+                        break
 
                 current_frame += step_frames
 
@@ -179,6 +217,68 @@ class VideoCropper:
             logger.info(f"YOLO detected full-screen streamer intro ending at {intro_end_sec:.1f}s.")
         return intro_end_sec
 
+    def _detect_facecam_crop_box(
+        self,
+        raw_video_path: Path,
+        start_time: float,
+        duration: float,
+        webcam_corner: str,
+        v_width: int,
+        v_height: int,
+    ) -> tuple[int, int, int, int]:
+        """
+        Finds the tight 1080:672 crop rectangle (w, h, x, y) enclosing the corner webcam
+        via YOLO person detection so zero background gameplay leaks into FACECAM_SPLIT.
+        """
+        ratio = 1080.0 / 672.0
+        corner_lc = str(webcam_corner or "top_right").lower()
+        cw = max(2, min(v_width & ~1, int(v_width * 0.18) & ~1))
+        ch = max(2, min(v_height & ~1, int(round(cw / ratio)) & ~1))
+        pad_x = max(2, int(v_width * 0.014))
+        pad_y = max(2, int(v_height * 0.085))
+        tx = max(0, v_width - cw - pad_x) if "right" in corner_lc else min(pad_x, max(0, v_width - cw))
+        ty = max(0, v_height - ch - pad_y) if "bottom" in corner_lc else min(pad_y, max(0, v_height - ch))
+
+        try:
+            cap = cv2.VideoCapture(str(raw_video_path))
+            if cap.isOpened():
+                sample_ms = max(0.0, (float(start_time) + min(2.0, max(0.2, float(duration) * 0.35))) * 1000.0)
+                cap.set(cv2.CAP_PROP_POS_MSEC, sample_ms)
+                ok, frame = cap.read()
+                cap.release()
+                if ok and frame is not None and v_width >= 640 and v_height >= 360:
+                    rx1 = int(v_width * 0.65) if "right" in corner_lc else 0
+                    rx2 = v_width if "right" in corner_lc else int(v_width * 0.35)
+                    ry1 = int(v_height * 0.62) if "bottom" in corner_lc else 0
+                    ry2 = v_height if "bottom" in corner_lc else int(v_height * 0.38)
+                    roi = frame[ry1:ry2, rx1:rx2]
+                    model = self._get_yolo()
+                    res = model.predict(roi, classes=[0], conf=0.25, verbose=False)
+                    if res and len(res[0].boxes) > 0:
+                        best = max(res[0].boxes, key=lambda b: float(b.conf[0]))
+                        bx1, by1, bx2, by2 = best.xyxy[0].tolist()
+                        px1, py1, px2, py2 = rx1 + bx1, ry1 + by1, rx1 + bx2, ry1 + by2
+                        pw, ph = max(20.0, px2 - px1), max(20.0, py2 - py1)
+                        cx = (px1 + px2) / 2.0
+                        cw = max(
+                            int(v_width * 0.155),
+                            min(int(v_width * 0.205), int(pw * 1.24)),
+                        ) & ~1
+                        cw = max(2, min(v_width & ~1, cw))
+                        ch = max(2, min(v_height & ~1, int(round(cw / ratio)) & ~1))
+                        tx_raw = int(round(cx - cw / 2.0))
+                        tx = max(pad_x, min(tx_raw, max(0, v_width - cw - pad_x)))
+                        ty_raw = int(round(py1 - ph * 0.08))
+                        ty = max(4, min(ty_raw, max(0, v_height - ch - 4)))
+                        logger.info(
+                            f"YOLO locked FACECAM_SPLIT box for corner='{corner_lc}': "
+                            f"{cw}x{ch}@{tx & ~1},{ty & ~1}"
+                        )
+        except Exception as ex:
+            logger.warning(f"YOLO facecam lock skipped ({ex}); using corner fallback.")
+
+        return cw & ~1, ch & ~1, (tx & ~1), (ty & ~1)
+
     def crop_to_vertical(
         self,
         raw_video_path: Path,
@@ -188,7 +288,8 @@ class VideoCropper:
         mode: CropMode = CropMode.ACTION_TRACK,
         mask_webcam: bool = True,
         webcam_corner: str = "top_right",
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        creator_regions: Optional[List[CreatorOverlayRegion]] = None,
     ) -> Path:
         """
         Converts 16:9 gameplay to 1080x1920 (9:16) vertical using:
@@ -209,6 +310,34 @@ class VideoCropper:
         meta = self._get_video_metadata(raw_video_path)
         v_width = meta.get("width", 1920)
         v_height = meta.get("height", 1080)
+
+        regions = list(creator_regions or [])
+        if mask_webcam and not regions:
+            # Compatibility for direct callers with only an old corner hint.
+            corner = webcam_corner.lower()
+            regions = [CreatorOverlayRegion(
+                kind="facecam", x=0 if "left" in corner else .66,
+                y=.58 if "bottom" in corner else 0, width=.34, height=.42,
+            )]
+        rectangles = creator_mask_rectangles(regions, v_width, v_height)
+        reconstructed_path = None
+        if rectangles:
+            stat = raw_video_path.stat()
+            signature = json.dumps([str(raw_video_path.resolve()), stat.st_size, stat.st_mtime_ns,
+                                    start_time, duration, rectangles, "lama512-30fps-v1"])
+            key = hashlib.sha256(signature.encode()).hexdigest()[:24]
+            cache_dir = self.temp_dir / "creator_inpaint_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            reconstructed_path = cache_dir / f"{key}.mp4"
+            if not reconstructed_path.exists() or reconstructed_path.stat().st_size < 1000:
+                creator_inpainter.reconstruct_segment(
+                    raw_video_path, start_time, duration, rectangles, reconstructed_path, progress_callback,
+                )
+            raw_video_path = reconstructed_path
+            start_time = 0.0
+        # A dedicated facecam panel would enlarge the hidden camera. Use gameplay framing instead.
+        if rectangles and mode == CropMode.FACECAM_SPLIT:
+            mode = CropMode.CENTER_ZOOM
 
         filter_args = []
 
@@ -237,43 +366,36 @@ class VideoCropper:
             filter_args = ["-vf", vf]
 
         elif mode == CropMode.FACECAM_SPLIT:
-            # Top 35% (672px): Top-left facecam. Bottom 65% (1248px): centered gameplay
-            crop_top_w = int(v_width * 0.35)
-            crop_top_h = int(v_height * 0.45)
-            crop_bot_w = int(v_height * (9 / 16))
-            bot_x = int((v_width - crop_bot_w) / 2)
+            # Top 35% (672px): YOLO-locked streamer facecam (1080:672 = 1.607:1) so zero background leaks.
+            # Bottom 65% (1248px): 1080:1248 aspect-matched gameplay so full height & wider FOV remain intact.
+            crop_top_w, crop_top_h, top_x, top_y = self._detect_facecam_crop_box(
+                raw_video_path=raw_video_path,
+                start_time=start_time,
+                duration=duration,
+                webcam_corner=webcam_corner,
+                v_width=v_width,
+                v_height=v_height,
+            )
+            crop_bot_w = max(2, min(v_width & ~1, int(v_height * (1080.0 / 1248.0)) & ~1))
+            bot_x = max(0, (int((v_width - crop_bot_w) / 2)) & ~1)
             vf = (
-                f"[0:v]crop={crop_top_w}:{crop_top_h}:20:20,scale=1080:672[top];"
-                f"[0:v]crop={crop_bot_w}:{v_height}:{bot_x}:0,scale=1080:1248[bottom];"
+                f"[0:v]crop={crop_top_w}:{crop_top_h}:{top_x}:{top_y},"
+                "scale=1080:672:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:672[top];"
+                f"[0:v]crop={crop_bot_w}:{v_height}:{bot_x}:0,"
+                "scale=1080:1248:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1248[bottom];"
                 "[top][bottom]vstack,setsar=1[v_out]"
             )
             filter_args = ["-filter_complex", vf, "-map", "[v_out]"]
 
         else:  # CENTER_ZOOM (Landscape Centered in 9:16 with Blurred Background Fill)
-            if mask_webcam:
-                # Top-right webcam: X=750..1070, Y=660..890 on 1080x1920 canvas
-                if "left" in webcam_corner.lower():
-                    cam_x, cam_y, cam_w, cam_h = 10, 660, 320, 230
-                elif "bottom" in webcam_corner.lower():
-                    cam_x, cam_y, cam_w, cam_h = 750, 1030, 320, 230
-                else:  # top_right
-                    cam_x, cam_y, cam_w, cam_h = 750, 660, 320, 230
-
-                vf = (
-                    "[0:v]scale=1080:1920:flags=bicubic,boxblur=30:5[bg];"
-                    "[0:v]scale=1080:608:flags=lanczos[fg];"
-                    "[bg][fg]overlay=0:656,split=2[v_base][v_for_crop];"
-                    f"[v_for_crop]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},boxblur=30:5[cam_blur];"
-                    f"[v_base][cam_blur]overlay={cam_x}:{cam_y},setsar=1[v_clean]"
-                )
-                filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
-            else:
-                vf = (
-                    "[0:v]scale=1080:1920:flags=bicubic,boxblur=30:5[bg];"
-                    "[0:v]scale=1080:608:flags=lanczos[fg];"
-                    "[bg][fg]overlay=0:656,setsar=1[v_clean]"
-                )
-                filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
+            source_chain = "[0:v]split=2[bg_in][fg_in];"
+            vf = (
+                source_chain
+                + "[bg_in]scale=1080:1920:force_original_aspect_ratio=increase:flags=bicubic,crop=1080:1920,boxblur=30:5[bg];"
+                + "[fg_in]scale=1080:608:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:608:(ow-iw)/2:(oh-ih)/2[fg];"
+                + "[bg][fg]overlay=0:656,setsar=1[v_clean]"
+            )
+            filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
 
         cmd = [
             "ffmpeg", "-y",
@@ -289,6 +411,8 @@ class VideoCropper:
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0 or not output_cropped_path.exists() or output_cropped_path.stat().st_size < 1000:
+            if rectangles:
+                raise RuntimeError(f"Protected crop failed; refusing an unmasked fallback: {result.stderr[-1000:]}")
             logger.warning(f"FFmpeg crop failed or produced empty file: {result.stderr[:200] if result else ''}. Falling back to center crop.")
             # Fallback to simple center crop if complex filter fails
             fallback_cmd = [

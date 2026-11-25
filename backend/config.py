@@ -1,12 +1,10 @@
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Any
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Base project directories
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,21 +21,45 @@ for folder in [WORKSPACE_DIR, DOWNLOADS_DIR, PROXIES_DIR, RENDERS_DIR, ASSETS_DI
     folder.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------------------------------------------------------
-# Editable Model IDs (Centralized AI Brain Config)
+# Editable Model IDs & API Credentials (Dynamically Reloadable)
 # ------------------------------------------------------------------------------
-DIRECTOR_MODEL = os.getenv("DIRECTOR_MODEL", "gemini-2.5-flash")
-TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-tts")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
+DIRECTOR_MODEL = "gemini-2.5-flash"
+TTS_MODEL = "gemini-2.5-flash-tts"
+IMAGE_MODEL = "gemini-3.1-flash-image"
 
-# ------------------------------------------------------------------------------
-# API Credentials
-# ------------------------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-YOUTUBE_CLIENT_SECRETS_FILE = os.getenv("YOUTUBE_CLIENT_SECRETS_FILE", str(BASE_DIR / "client_secret.json"))
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-META_PAGE_ID = os.getenv("META_PAGE_ID", "")
-INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID", "")
-PUBLIC_TUNNEL_URL = os.getenv("PUBLIC_TUNNEL_URL", "")  # Used for Instagram URL container pull if needed
+GEMINI_API_KEY = ""
+YOUTUBE_CLIENT_SECRETS_FILE = str(BASE_DIR / "client_secret.json")
+META_ACCESS_TOKEN = ""
+META_PAGE_ID = ""
+INSTAGRAM_ACCOUNT_ID = ""
+PUBLIC_TUNNEL_URL = ""
+
+
+def reload_runtime_config() -> None:
+    """Reloads .env values into process environment and module globals."""
+    global DIRECTOR_MODEL, TTS_MODEL, IMAGE_MODEL
+    global GEMINI_API_KEY, YOUTUBE_CLIENT_SECRETS_FILE
+    global META_ACCESS_TOKEN, META_PAGE_ID, INSTAGRAM_ACCOUNT_ID, PUBLIC_TUNNEL_URL
+
+    env_path = BASE_DIR / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
+    else:
+        load_dotenv(override=True)
+
+    DIRECTOR_MODEL = os.getenv("DIRECTOR_MODEL", "gemini-2.5-flash")
+    TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-tts")
+    IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
+
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    YOUTUBE_CLIENT_SECRETS_FILE = os.getenv("YOUTUBE_CLIENT_SECRETS_FILE", str(BASE_DIR / "client_secret.json"))
+    META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
+    META_PAGE_ID = os.getenv("META_PAGE_ID", "")
+    INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID", "")
+    PUBLIC_TUNNEL_URL = os.getenv("PUBLIC_TUNNEL_URL", "")
+
+
+reload_runtime_config()
 
 # ------------------------------------------------------------------------------
 # Cross-Platform Hardware Engine Detection
@@ -87,7 +109,18 @@ class HardwareEngine:
             
             # Check for VideoToolbox support in FFmpeg
             ffmpeg_path = shutil.which("ffmpeg")
-            has_videotoolbox = True  # Default on modern macOS with Homebrew ffmpeg
+            has_videotoolbox = False
+            if ffmpeg_path:
+                try:
+                    enc_out = subprocess.run(
+                        [ffmpeg_path, "-hide_banner", "-encoders"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    has_videotoolbox = "h264_videotoolbox" in (enc_out.stdout or "")
+                except Exception:
+                    has_videotoolbox = True
             
             if has_videotoolbox:
                 self.ffmpeg_codec = "h264_videotoolbox"
