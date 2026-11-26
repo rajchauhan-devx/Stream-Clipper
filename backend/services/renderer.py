@@ -1,10 +1,13 @@
 import os
+import re
 import logging
 import subprocess
 from pathlib import Path
 from typing import Optional, Callable
 
 from backend.config import RENDERS_DIR, ASSETS_DIR, HARDWARE
+from backend.services.comparison import FPS, ComparisonTimeline
+from backend.services.comparison_motion import COMPARISON_ASSETS, panel_logo_overlay, pop_audio_filters
 
 logger = logging.getLogger("gta6-studio.renderer")
 
@@ -84,6 +87,68 @@ class VideoRenderer:
         except Exception as e:
             logger.warning(f"Could not generate badge PNG: {e}")
         return badge_path
+
+    def write_comparison_title(self, title: str, path: Path) -> None:
+        """Draw the fixed race graphic, with the last word accented on black."""
+        from PIL import Image, ImageDraw
+
+        headline = " ".join(self._strip_emojis(title).upper().split())
+        game = r"GTA\s*(?:VI|IV|V|[456]|FOUR|FIVE|SIX)"
+        matchup = rf"{game}\s+(?:VS\.?|VERSUS)\s+{game}"
+        # The panel logos already identify the games. Keep the topic and punctuation.
+        topic = re.sub(rf"\s+(?:IN\s+)?{matchup}([?!.]?)$", r"\1", headline)
+        topic = re.sub(rf"^{matchup}\s*[•:|–—-]\s*", "", topic)
+        words = (topic or "GAME COMPARISON").split()
+        lead, accent = " ".join(words[:-1]), words[-1]
+        if not lead:
+            lead, accent = accent, ""
+
+        fonts = ["DIN Condensed Bold.ttf", "Impact.ttf", "DejaVuSansCondensed-Bold.ttf", "DejaVuSans-Bold.ttf"]
+        accent_width = min(345, max(212, round(_get_font(fonts, 73).getlength(accent[:80])) + 38))
+        split = 756 - accent_width if accent else 728
+        tile = Image.new("RGBA", (808, 87))
+        draw = ImageDraw.Draw(tile)
+        draw.rectangle((0, 0, 755, 86), fill="#14171b")
+        draw.rectangle((0, 0, split - 1, 86), fill="#ddfb47")
+        for left, right in ((763, 773), (783, 788)):
+            draw.rectangle((left, 0, right, 86), fill="#ddfb47")
+
+        for text, x, limit, size, fill in (
+            (lead, 17, split - 34, 66, "#151719"),
+            (accent, split + 19, 756 - split - 32, 73, "#ffffff"),
+        ):
+            if not text:
+                continue
+            # Only shorten text when it would otherwise collide at the smallest size.
+            if len(text) > 160:
+                text = text[:159].rstrip() + "…"
+            font = _get_font(fonts, size)
+            while size > 36 and font.getlength(text) > limit:
+                size -= 2
+                font = _get_font(fonts, size)
+            y = 44
+            if x == 17 and font.getlength(text) > limit and " " in text:
+                # A longer question gets two lines inside the same plate.
+                font = _get_font(fonts, 33)
+                first_line = ""
+                for word in text.split():
+                    candidate = f"{first_line} {word}".strip()
+                    if font.getlength(candidate) > limit:
+                        break
+                    first_line = candidate
+                if first_line:
+                    draw.text((x, 23), first_line, font=font, anchor="lm", fill=fill)
+                    text = text[len(first_line):].lstrip()
+                    y = 61
+            if font.getlength(text) > limit:
+                prefix = text
+                while prefix and font.getlength(prefix + "…") > limit:
+                    prefix = prefix[:-1]
+                text = prefix.rstrip() + "…"
+            draw.text((x, y), text, font=font, anchor="lm", fill=fill)
+        # Shear text and stripes together, keeping both angled ends on the canvas.
+        tile.transform(tile.size, Image.Transform.AFFINE, (1, 0.1944, -17, 0, 1, 0),
+                       resample=Image.Resampling.BICUBIC).save(path)
 
     def generate_topic_banner(
         self,
@@ -230,9 +295,10 @@ class VideoRenderer:
         # Assemble full command
         cmd = ["ffmpeg", "-y", *inputs]
 
+        video_map = "0:v" if v_stream == "0:v" else f"[{v_stream}]"
         if filter_chain:
             full_filter = ";".join(filter_chain)
-            cmd.extend(["-filter_complex", full_filter, "-map", f"[{v_stream}]", "-map", "[a_master]"])
+            cmd.extend(["-filter_complex", full_filter, "-map", video_map, "-map", "[a_master]"])
         else:
             cmd.extend(["-map", "0:v", "-map", "1:a"])
 
@@ -260,7 +326,7 @@ class VideoRenderer:
             # Fallback CPU command
             cpu_cmd = ["ffmpeg", "-y", *inputs]
             if filter_chain:
-                cpu_cmd.extend(["-filter_complex", full_filter, "-map", f"[{v_stream}]", "-map", "[a_master]"])
+                cpu_cmd.extend(["-filter_complex", full_filter, "-map", video_map, "-map", "[a_master]"])
             else:
                 cpu_cmd.extend(["-map", "0:v", "-map", "1:a"])
             cpu_cmd.extend([
@@ -292,104 +358,8 @@ class VideoRenderer:
         return final_mp4_path
 
     # --------------------------------------------------------------------------
-    # Comparison Engine: Vice City Gradient VS Badge & Multi-Format Compositor
+    # Comparison compositor
     # --------------------------------------------------------------------------
-    def generate_vs_badge(self, width: int = 300, height: int = 96) -> Path:
-        """
-        Creates the iconic Vice City Neon Gradient "VS" Badge:
-        Hot Magenta (#EE4DA0) to Electric Cyan (#00FFE6) with metallic dark glass.
-        """
-        badge_path = self.assets_dir / "vice_city_vs_badge.png"
-        if badge_path.exists():
-            return badge_path
-        try:
-            from PIL import Image, ImageDraw
-            img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-
-            pad = 4
-            # Dark frosted glass pill
-            draw.rounded_rectangle([pad, pad, width - pad, height - pad], radius=24, fill=(14, 11, 24, 245))
-
-            # Vice City Neon Gradient border (Hot Magenta -> Electric Cyan)
-            for x in range(pad, width - pad):
-                factor = (x - pad) / max(1, (width - 2 * pad))
-                r = int(238 * (1 - factor) + 0 * factor)
-                g = int(77 * (1 - factor) + 255 * factor)
-                b = int(160 * (1 - factor) + 230 * factor)
-                draw.line([(x, pad), (x, pad + 2)], fill=(r, g, b, 255))
-                draw.line([(x, height - pad - 2), (x, height - pad)], fill=(r, g, b, 255))
-
-            draw.line([(pad, pad), (pad, height - pad)], fill=(238, 77, 160, 255), width=2)
-            draw.line([(width - pad, pad), (width - pad, height - pad)], fill=(0, 255, 230, 255), width=2)
-
-            # Inner subtle glass highlight
-            draw.rounded_rectangle([pad + 3, pad + 3, width - pad - 3, height - pad - 3], radius=20, outline=(255, 255, 255, 40), width=1)
-
-            # "VS" typography in bold Impact font
-            font_vs = _get_font(["impact.ttf", "Impact.ttf", "arialbd.ttf"], 56)
-            text = "VS"
-            bbox = draw.textbbox((0, 0), text, font=font_vs)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            tx = (width - tw) // 2
-            ty = (height - th) // 2 - 4
-
-            # Drop shadow
-            draw.text((tx + 2, ty + 2), text, fill=(0, 0, 0, 220), font=font_vs)
-            # Vibrant white core
-            draw.text((tx, ty), text, fill=(255, 255, 255, 255), font=font_vs)
-
-            # Neon accent dots
-            draw.ellipse([tx - 26, height // 2 - 6, tx - 14, height // 2 + 6], fill=(238, 77, 160, 255))
-            draw.ellipse([tx + tw + 14, height // 2 - 6, tx + tw + 26, height // 2 + 6], fill=(0, 255, 230, 255))
-
-            img.save(str(badge_path))
-            logger.info(f"Generated Vice City VS badge at {badge_path}")
-        except Exception as e:
-            logger.warning(f"Could not generate VS badge: {e}")
-        return badge_path
-
-    def generate_game_badge(self, game: str = "gta6", width: int = 210, height: int = 50) -> Path:
-        """Generates game title pill badge: GTA VI, GTA V, or GTA IV"""
-        g_clean = str(game).lower()
-        badge_path = self.assets_dir / f"badge_{g_clean}.png"
-        if badge_path.exists():
-            return badge_path
-        try:
-            from PIL import Image, ImageDraw
-            img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-
-            if "4" in g_clean or "iv" in g_clean:
-                title = "GTA IV"
-                sub = "LIBERTY CITY"
-                border_col = (245, 158, 11, 230)
-                accent_col = (251, 191, 36, 255)
-            elif "5" in g_clean or "v" in g_clean:
-                title = "GTA V"
-                sub = "LOS SANTOS"
-                border_col = (139, 92, 246, 230)
-                accent_col = (16, 185, 129, 255)
-            else:
-                title = "GTA VI"
-                sub = "VICE CITY"
-                border_col = (238, 77, 160, 230)
-                accent_col = (0, 255, 230, 255)
-
-            draw.rounded_rectangle([0, 0, width - 1, height - 1], radius=12, fill=(15, 12, 25, 235), outline=border_col, width=2)
-            draw.line([12, 8, 12, height - 8], fill=accent_col, width=3)
-
-            font_main = _get_font(["impact.ttf", "Impact.ttf", "arialbd.ttf"], 24)
-            font_sub = _get_font(["arialbd.ttf", "Arial Bold.ttf", "arial.ttf"], 11)
-
-            draw.text((24, 10), title, fill=(255, 255, 255), font=font_main)
-            draw.text((105, 17), f"• {sub}", fill=accent_col, font=font_sub)
-
-            img.save(str(badge_path))
-        except Exception as e:
-            logger.warning(f"Could not generate game badge for {game}: {e}")
-        return badge_path
-
     def render_comparison_clip(
         self,
         base_video_path: Path,
@@ -399,8 +369,12 @@ class VideoRenderer:
         comparison_format: str = "shorts_split",
         base_game: str = "gta5",
         ass_subtitles_path: Optional[Path] = None,
-        topic_banner_path: Optional[Path] = None,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        timeline: Optional[ComparisonTimeline] = None,
+        logo_frames: tuple[int | None, int | None] = (None, None),
+        logo_movies: Optional[dict[str, Path]] = None,
+        slide_frame: int = 0,
+        title_path: Optional[Path] = None,
     ) -> Path:
         """
         Renders side-by-side or top/bottom comparison video:
@@ -410,16 +384,18 @@ class VideoRenderer:
         if progress_callback:
             progress_callback(30, f"Compositing comparison video ({comparison_format})...")
 
-        vs_badge_path = self.generate_vs_badge()
-        base_badge_path = self.generate_game_badge(base_game)
-        gta6_badge_path = self.generate_game_badge("gta6")
+        logo_dir = COMPARISON_ASSETS
+        vs_badge_path = logo_dir / "vs-silver.png"
+        base_badge_path = logo_dir / {"gta4": "gta4.png", "gta5": "gta5.png"}[base_game]
+        gta6_badge_path = logo_dir / "gta6.png"
 
+        logo_movies = logo_movies or {}
         inputs = [
             "-i", str(base_video_path),
             "-i", str(gta6_video_path),
             "-i", str(vs_badge_path),
-            "-i", str(base_badge_path),
-            "-i", str(gta6_badge_path),
+            "-i", str(logo_movies.get(base_game, base_badge_path)),
+            "-i", str(logo_movies.get("gta6", gta6_badge_path)),
             "-i", str(mixed_audio_path)
         ]
 
@@ -431,75 +407,53 @@ class VideoRenderer:
         # 4 = GTA 6 badge PNG
         # 5 = Mixed audio
 
-        filter_chain = []
-
-        if comparison_format == "long_side_by_side":
-            # 16:9 Landscape: 1920x1080
-            # Left half (0..960): Base Game (centered 16:9 in 960x1080)
-            # Right half (960..1920): GTA 6 (centered 16:9 in 960x1080)
+        landscape = comparison_format == "long_side_by_side"
+        panel = "960:1080" if landscape else "1080:960"
+        stack = "hstack" if landscape else "vstack"
+        second_logo_x = "W-w-30" if landscape else "30"
+        fill_panel = f"setpts=PTS-STARTPTS,fps=60,scale={panel}:force_original_aspect_ratio=increase,crop={panel},setsar=1"
+        filter_chain = timeline.video_filters() if timeline else []
+        older_input, gta6_input = ("older_playback", "six_playback") if timeline else ("0:v", "1:v")
+        filter_chain.extend([
+            f"[{older_input}]{fill_panel}[base]",
+            # Clear the top-edge HUD that would otherwise sit behind the center mark.
+            f"[{gta6_input}]crop=iw:trunc(ih*0.95/2)*2:0:ih-oh,{fill_panel}[six]",
+        ])
+        from PIL import Image
+        for panel_name, index, game, logo, end_x, end_y, frame in (
+            ("base", 3, base_game, base_badge_path, "30", "30", logo_frames[0]),
+            ("six", 4, "gta6", gta6_badge_path, second_logo_x, "30", logo_frames[1]),
+        ):
+            with Image.open(logo) as artwork:
+                logo_size = artwork.size
+            filter_chain.extend(panel_logo_overlay(
+                panel_name, index, f"{panel_name}_labeled", end_x, end_y,
+                logo_size, frame if game in logo_movies else None, slide_frame,
+            ))
+        filter_chain.extend([
+            f"[base_labeled][six_labeled]{stack}=inputs=2:shortest=1[stacked]",
+            "[stacked][2:v]overlay=(W-w)/2:(H-h)/2[v_staged]",
+        ])
+        v_curr = "v_staged"
+        if title_path is not None:
+            inputs.extend(["-i", str(title_path)])
+            title_x = "(W-w)/2" if landscape else "230"
+            hook_frames = timeline.hook if timeline else 3 * FPS
+            fade_frames = min(15, hook_frames)
             filter_chain.extend([
-                "[0:v]setpts=PTS-STARTPTS,fps=60,split=2[l_bg_in][l_fg_in]",
-                "[l_bg_in]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_left]",
-                "[l_fg_in]scale=960:540:force_original_aspect_ratio=decrease[fg_left]",
-                "[bg_left][fg_left]overlay=(W-w)/2:(H-h)/2[left_comp]",
-                "[left_comp][3:v]overlay=30:30[left_badged]",
-
-                "[1:v]setpts=PTS-STARTPTS,fps=60,split=2[r_bg_in][r_fg_in]",
-                "[r_bg_in]scale=960:1080:force_original_aspect_ratio=increase,crop=960:1080,boxblur=20:5[bg_right]",
-                "[r_fg_in]scale=960:540:force_original_aspect_ratio=decrease[fg_right]",
-                "[bg_right][fg_right]overlay=(W-w)/2:(H-h)/2[right_comp]",
-                "[right_comp][4:v]overlay=W-w-30:30[right_badged]",
-
-                "[left_badged][right_badged]hstack=inputs=2:shortest=1[h_stacked]",
-                "[h_stacked][2:v]overlay=(W-w)/2:(H-h)/2[v_staged]"
+                f"[6:v]format=rgba,settb=1/{FPS},loop=loop=-1:size=1:start=0,trim=end_frame={hook_frames},"
+                f"setpts=N/({FPS}*TB),fade=t=out:s={hook_frames - fade_frames}:n={fade_frames}:alpha=1[title]",
+                f"[{v_curr}][title]overlay={title_x}:38:eof_action=pass:enable='lt(n,{hook_frames})'[v_title]",
             ])
-            v_curr = "v_staged"
+            v_curr = "v_title"
+        if ass_subtitles_path and ass_subtitles_path.exists():
+            escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
+            filter_chain.append(f"[{v_curr}]ass={escaped_ass}[v_subbed]")
+            v_curr = "v_subbed"
 
-            if topic_banner_path and topic_banner_path.exists():
-                inputs.extend(["-i", str(topic_banner_path)])
-                tb_idx = len(inputs) // 2 - 1
-                filter_chain.append(f"[{v_curr}][{tb_idx}:v]overlay=(W-w)/2:25[v_head]")
-                v_curr = "v_head"
-
-            if ass_subtitles_path and ass_subtitles_path.exists():
-                escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
-                filter_chain.append(f"[{v_curr}]ass={escaped_ass}[v_subbed]")
-                v_curr = "v_subbed"
-
-        else:
-            # 9:16 Vertical Shorts: 1080x1920
-            # Top half (0..960): Base Game (1080x608 centered in 0..960, Y=176..784)
-            # Bottom half (960..1920): GTA 6 (1080x608 centered in 960..1920, Y=176..784 local)
-            filter_chain.extend([
-                "[0:v]setpts=PTS-STARTPTS,fps=60,split=2[t_bg_in][t_fg_in]",
-                "[t_bg_in]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_top]",
-                "[t_fg_in]scale=1080:608:force_original_aspect_ratio=decrease[fg_top]",
-                "[bg_top][fg_top]overlay=(W-w)/2:(H-h)/2[top_comp]",
-                "[top_comp][3:v]overlay=30:188[top_badged]",
-
-                "[1:v]setpts=PTS-STARTPTS,fps=60,split=2[b_bg_in][b_fg_in]",
-                "[b_bg_in]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:960,boxblur=20:5[bg_bot]",
-                "[b_fg_in]scale=1080:608:force_original_aspect_ratio=decrease[fg_bot]",
-                "[bg_bot][fg_bot]overlay=(W-w)/2:(H-h)/2[bot_comp]",
-                "[bot_comp][4:v]overlay=30:188[bot_badged]",
-
-                "[top_badged][bot_badged]vstack=inputs=2:shortest=1[v_stacked]",
-                "[v_stacked][2:v]overlay=(W-w)/2:960-(h/2)[v_staged]"
-            ])
-            v_curr = "v_staged"
-
-            if topic_banner_path and topic_banner_path.exists():
-                inputs.extend(["-i", str(topic_banner_path)])
-                tb_idx = len(inputs) // 2 - 1
-                filter_chain.append(f"[{v_curr}][{tb_idx}:v]overlay=(W-w)/2:30[v_head]")
-                v_curr = "v_head"
-
-            if ass_subtitles_path and ass_subtitles_path.exists():
-                escaped_ass = _escape_ffmpeg_filter_path(ass_subtitles_path)
-                filter_chain.append(f"[{v_curr}]ass={escaped_ass}[v_subbed]")
-                v_curr = "v_subbed"
-
-        filter_chain.append("[5:a]loudnorm=I=-14:LRA=11:TP=-1.5[a_master]")
+        pop_filters, audio_input = pop_audio_filters(logo_frames)
+        filter_chain.extend(pop_filters)
+        filter_chain.append(f"{audio_input}loudnorm=I=-14:LRA=11:TP=-1.5[a_master]")
 
         full_filter = ";".join(filter_chain)
         codec = HARDWARE.ffmpeg_codec

@@ -89,7 +89,7 @@ class TestCreatorMasker(unittest.TestCase):
 
     def test_audit_failure_stops_shared_render_before_any_crop(self):
         clip = dict(clip_id='test', start_time=5, duration=6, video_format='explainer', narration_language='english',
-                    verification_passed=True, voice_path=str(self.root / 'voice.wav'),
+                    verification_passed=True, voice_path=str(self.root / 'test_continuous_voice.wav'),
                     beats=[{'start_time': 5, 'duration': 3}, {'start_time': 100, 'duration': 3}])
         job = {'clips': [clip], 'request': {'enable_watermark_masker': True, 'crop_mode': 'action_track'},
                'metadata': {'raw_path': str(self.source), 'duration': 200, 'cut_start_sec': 10}}

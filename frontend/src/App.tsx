@@ -1,3 +1,6 @@
+import { libraryRequest } from './footageApi';
+import FootageLibrary, { type LibrarySetup, type LibraryView } from './FootageLibrary';
+import ComparisonBoard, { comparisonDraftKey } from './ComparisonBoard';
 import { useState, useEffect, useRef } from 'react';
 import {
   Zap,
@@ -38,7 +41,6 @@ import {
   X,
   Columns,
   Layers,
-  UploadCloud,
   Loader2
 } from 'lucide-react';
 
@@ -70,6 +72,7 @@ interface SocialMetadata {
 }
 
 interface StoryBeat {
+  rank?: number;
   beat_id: string;
   label: string;
   start_time: number;
@@ -81,8 +84,9 @@ interface StoryBeat {
 }
 
 interface Clip {
+  library_ids?: string[];
   clip_id: string;
-  clip_type?: 'story_montage' | 'single_moment';
+  clip_type?: 'story_montage' | 'single_moment' | 'ranked_highlight';
   video_format?: 'highlight' | 'explainer';
   start_time: number;
   end_time: number;
@@ -110,7 +114,7 @@ interface Clip {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'new_project' | 'studio' | 'comparison' | 'youtube' | 'facebook' | 'upload' | 'settings'>('new_project');
+  const [activeTab, setActiveTab] = useState<'master' | 'new_project' | 'studio' | 'comparison' | 'youtube' | 'facebook' | 'upload' | 'settings'>('master');
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
 
   // YouTube Direct Publishing State
@@ -152,26 +156,11 @@ export default function App() {
   const [showFbAuthModal, setShowFbAuthModal] = useState(false);
 
   // Comparison Studio State (GTA 5/4 vs GTA 6)
-  const [compFormat, setCompFormat] = useState<'shorts_split' | 'long_side_by_side'>('shorts_split');
-  const [compBaseGame, setCompBaseGame] = useState<'gta5' | 'gta4'>('gta5');
-  const [compGta6Url, setCompGta6Url] = useState('https://youtu.be/2LySmj8f24U');
-  const [compGta6StartTime, setCompGta6StartTime] = useState('00:00:40');
-  const [compGta6Duration, setCompGta6Duration] = useState(15);
-  const [compBaseUrl, setCompBaseUrl] = useState('https://youtu.be/2LySmj8f24U');
-  const [compBaseStartTime, setCompBaseStartTime] = useState('00:00:10');
-  const [compBaseDuration, setCompBaseDuration] = useState(15);
-  const [compQuest, setCompQuest] = useState<any>(null);
-  const [isGeneratingQuest, setIsGeneratingQuest] = useState(false);
-  const [compUploadedPath, setCompUploadedPath] = useState<string | null>(null);
-  const [compUploadedName, setCompUploadedName] = useState<string | null>(null);
-  const [isUploadingRec, setIsUploadingRec] = useState(false);
-  const [compHookText, setCompHookText] = useState('GTA 5 VS GTA 6 • POLICE AI COMPARISON 🚨');
-  const [compCommentaryScript, setCompCommentaryScript] = useState('How did Rockstar completely revolutionize police AI from GTA 5 to GTA 6? In GTA 5, police instantly opened lethal fire with zero warning. But in GTA 6, officers first issue verbal defusal commands and only draw weapons if threatened. Which game has better details?');
-  const [compTtsVoice, setCompTtsVoice] = useState('Charon');
-  const [isRenderingComp, setIsRenderingComp] = useState(false);
+  const [picker, setPicker] = useState<LibraryView | null>(null);
+  const [savedSetup,setSavedSetup] = useState<LibrarySetup | null>(null);
+  const [boardVersion, setBoardVersion] = useState(0);
   const [compRenderResult, setCompRenderResult] = useState<any>(null);
   const [savedComparisons, setSavedComparisons] = useState<any[]>([]);
-  const [compRenderError, setCompRenderError] = useState<string | null>(null);
 
   // Form states
   const [urlOrFile, setUrlOrFile] = useState('');
@@ -442,7 +431,6 @@ export default function App() {
           if (job.metadata) setJobMetadata(job.metadata);
           if (job.clips && job.clips.length > 0) {
             setClips(job.clips);
-            setActiveTab('studio');
           }
           if (isActiveStatus(job.status)) {
             setIsLaunching(true);
@@ -480,7 +468,7 @@ export default function App() {
     setIsLaunching(true);
     setPipelineError(null);
     setProgressPct(5);
-    setProgressMsg(videoFormat === 'explainer' ? 'Reading the source to discover complete explanations...' : selectedMode === 'manual_studio' ? 'Scanning video to extract all real missions...' : 'Initializing autonomous batch pipeline...');
+    setProgressMsg(videoFormat === 'explainer' ? 'Reading the source to discover complete explanations...' : 'Finding distinct gameplay payoffs for the ranking…');
     setPipelineStep('ingesting');
     const initialTime = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     setActivityLogs([{
@@ -565,6 +553,8 @@ export default function App() {
       setSavedComparisons([]);
       setCompRenderResult(null);
       setProgressPct(0);
+      localStorage.removeItem(comparisonDraftKey);
+      setBoardVersion(v => v + 1);
       setProgressMsg('All data reset. Workspace is completely clean.');
       setPipelineError(null);
       setPipelineStep('idle');
@@ -701,104 +691,6 @@ export default function App() {
     }
   };
 
-  // Comparison Studio Handlers
-  const handleGenerateQuest = async () => {
-    if (!compGta6Url) return;
-    setIsGeneratingQuest(true);
-    setCompRenderError(null);
-    try {
-      const res = await fetch('/api/comparison/generate-quest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gta6_url_or_path: compGta6Url,
-          base_game: compBaseGame,
-          target_language: language,
-          start_time: compGta6StartTime,
-          duration_sec: compGta6Duration,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || 'Failed to generate comparison quest');
-      }
-      setCompQuest(data);
-      if (data.hook_text) setCompHookText(data.hook_text);
-      if (data.commentary_script) setCompCommentaryScript(data.commentary_script);
-    } catch (e: any) {
-      console.error('Quest generation failed:', e);
-      setCompRenderError(e.message || 'Failed to generate comparison quest');
-    } finally {
-      setIsGeneratingQuest(false);
-    }
-  };
-
-  const handleUploadRecording = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setIsUploadingRec(true);
-    const fd = new FormData();
-    fd.append('file', file);
-    try {
-      const res = await fetch('/api/comparison/upload-recording', {
-        method: 'POST',
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || 'Recording upload failed');
-      }
-      if (data.file_path) {
-        setCompUploadedPath(data.file_path);
-        setCompUploadedName(data.filename);
-        setCompBaseUrl(data.file_path);
-        showToast(`Uploaded recording: ${data.filename}`, 'success');
-      }
-    } catch (e: any) {
-      console.error('Recording upload failed:', e);
-      showToast('Upload failed: ' + e.message, 'error');
-    } finally {
-      setIsUploadingRec(false);
-    }
-  };
-
-  const handleRenderComparison = async () => {
-    setIsRenderingComp(true);
-    setCompRenderError(null);
-    setCompRenderResult(null);
-    try {
-      const res = await fetch('/api/comparison/render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          format: compFormat,
-          base_game: compBaseGame,
-          gta6_url_or_path: compGta6Url,
-          gta6_start_time: compGta6StartTime,
-          gta6_duration_sec: compGta6Duration,
-          base_game_url_or_path: compBaseUrl,
-          base_game_start_time: compBaseStartTime,
-          base_game_duration_sec: compBaseDuration,
-          hook_text: compHookText,
-          commentary_script: compCommentaryScript,
-          tts_voice: compTtsVoice,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Comparison rendering failed');
-      }
-      const data = await res.json();
-      setCompRenderResult(data);
-      refreshSavedComparisons(false);
-    } catch (e: any) {
-      console.error('Render comparison failed:', e);
-      setCompRenderError(e.message || 'Comparison render failed');
-    } finally {
-      setIsRenderingComp(false);
-    }
-  };
-
   // 1-Click Export Pack: Downloads MP4 & copies formatted captions/tags to clipboard
   const handleExportPack = () => {
     if (!activeClip) return;
@@ -887,6 +779,12 @@ export default function App() {
     }
   };
 
+  function openLibraryJob(job: any) {
+    setPicker(null); selectSavedJob(job); refreshAllJobs(); setActiveTab('studio');
+  }
+  function openSetup(setup: LibrarySetup) {
+    setPicker(null); setSavedSetup(setup); setActiveTab('comparison');
+  }
   const activeClip = clips[selectedClipIndex];
 
   // Synchronize active clip metadata with YouTube Direct form
@@ -1192,6 +1090,9 @@ export default function App() {
 
           {/* Navigation Links */}
           <nav className="p-3 space-y-1">
+            <button onClick={()=>setActiveTab('master')} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold ${activeTab==='master'?'bg-indigo-600/15 text-indigo-300':'text-slate-300 hover:bg-[#141821]'}`}>
+              <Layers size={16}/> Master Screen
+            </button>
             <button
               onClick={() => setActiveTab('new_project')}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-medium transition-all ${
@@ -1388,6 +1289,11 @@ export default function App() {
 
         {/* Dynamic View Body */}
         <div className="flex-1 overflow-y-auto p-8">
+          {activeTab==='master' && <FootageLibrary view={{}} onCompare={openSetup} onJob={openLibraryJob}/>}
+          {picker && <div role="dialog" aria-label="Saved footage" className="fixed inset-0 z-50 overflow-auto bg-black/75 p-4 md:p-8">
+            <div className="mx-auto max-w-5xl rounded-2xl bg-[#10141d] p-5 md:p-8">
+              <FootageLibrary view={picker} onCompare={openSetup} onJob={openLibraryJob} onClose={()=>setPicker(null)}/>
+            </div></div>}
           {/* VIEW 1: NEW PROJECT */}
           {activeTab === 'new_project' && (
             <div className="max-w-4xl mx-auto space-y-6">
@@ -1401,11 +1307,11 @@ export default function App() {
               <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-5 space-y-3">
                 <p className="text-xs font-semibold text-slate-300">Video format</p>
                 <div className="flex gap-2">
-                  <button type="button" aria-pressed={videoFormat === 'explainer'} onClick={() => { setVideoFormat('explainer'); setVoiceoverPacing('full_commentary'); }}
+                  <button type="button" aria-pressed={videoFormat === 'explainer'} onClick={() => { if (videoFormat !== 'explainer') { setClipLength('30s-55s'); setClipCount(3); } setVideoFormat('explainer'); setVoiceoverPacing('full_commentary'); }}
                     className={`px-4 py-2 rounded-lg text-sm font-semibold ${videoFormat === 'explainer' ? 'bg-indigo-600 text-white' : 'bg-[#0B0D12] text-slate-400'}`}>
                     Explainer
                   </button>
-                  <button type="button" aria-pressed={videoFormat === 'highlight'} onClick={() => setVideoFormat('highlight')}
+                  <button type="button" aria-pressed={videoFormat === 'highlight'} onClick={() => { if (videoFormat !== 'highlight') { setVideoFormat('highlight'); setClipLength('60s-95s'); setClipCount(1); } }}
                     className={`px-4 py-2 rounded-lg text-sm font-semibold ${videoFormat === 'highlight' ? 'bg-indigo-600 text-white' : 'bg-[#0B0D12] text-slate-400'}`}>
                     Highlight
                   </button>
@@ -1413,8 +1319,9 @@ export default function App() {
                 <p className="text-xs text-slate-400">
                   {videoFormat === 'explainer'
                     ? 'Turn an interesting story or topic from your long video into a short explanation. Keep the essential context, developments, and outcome with full voice commentary.'
-                    : 'Find action moments using the existing highlight selection workflow.'}
+                    : 'Rank up to five funny gameplay moments in each Short. Each cut reveals a label on the leaderboard. The number one moment plays last.'}
                 </p>
+                <button className="rounded-lg bg-indigo-600/20 px-4 py-2 text-sm font-bold text-indigo-200" onClick={()=>setPicker({role:videoFormat==='explainer'?'commentary':'highlight'})}>Use saved footage</button>
                 {videoFormat === 'explainer' && (
                   <div>
                     <label htmlFor="explainer-topic" className="block text-xs text-slate-300 mb-1">Topic to explain (optional)</label>
@@ -1445,15 +1352,24 @@ export default function App() {
                   </div>
                 </div>
 
+                {/^https?:\/\//i.test(urlOrFile.trim()) && <button type="button"
+                  className="mt-3 rounded-lg border border-indigo-500/50 px-3 py-2 text-sm text-indigo-200"
+                  onClick={async () => {
+                    try {
+                      const {id} = await libraryRequest<{id:string}>('/scan','POST',{url:urlOrFile.trim()});
+                      setPicker({role:videoFormat==='explainer'?'commentary':'highlight',source:id});
+                    } catch (error) { showToast((error as Error).message,'error'); }
+                  }}>Scan full video for all formats</button>}
+
                 {/* Settings Grid */}
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
                   {/* Language */}
                   <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl">
                     <div className="flex items-center gap-2 mb-2 text-slate-300">
                       <Languages className="h-4 w-4 text-indigo-400" />
-                      <span className="text-xs font-semibold">Narration Language</span>
+                      <span className="text-xs font-semibold">{videoFormat === 'highlight' ? 'Audio' : 'Narration Language'}</span>
                     </div>
-                    <p className="text-xs text-white">English only</p>
+                    <p className="text-xs text-white">{videoFormat === 'highlight' ? 'Gameplay, music bed and rank reveals' : 'English only'}</p>
                   </div>
 
                   {/* Length & Count */}
@@ -1471,6 +1387,7 @@ export default function App() {
                         <option value="30s-45s">30s – 45s</option>
                         <option value="30s-55s">30s – 55s</option>
                         <option value="45s-60s">45s – 60s</option>
+                        {videoFormat === 'highlight' && <option value="60s-95s">60s – 95s</option>}
                       </select>
                       <select
                         value={clipCount}
@@ -1560,6 +1477,7 @@ export default function App() {
                   </button>
                 </div>
 
+                {videoFormat === 'explainer' && <>
                 {/* Top Topic Headline Banner */}
                 <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
                   <div className="flex items-center gap-2.5">
@@ -1586,6 +1504,7 @@ export default function App() {
                   </button>
                 </div>
 
+                </>}
                 {/* Human-Like 5-FPS Close-Up Verification */}
                 {videoFormat === 'highlight' && (
                 <div className="flex items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4">
@@ -1593,13 +1512,13 @@ export default function App() {
                     <Eye className="h-4 w-4 text-cyan-400" />
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-white">Human-Like 5-FPS Close-Up Verify</span>
-                        <span className="text-[9px] bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 rounded font-mono font-bold">4-STAGE AI</span>
+                        <span className="text-xs font-bold text-white">Check Highlight framing</span>
                       </div>
-                      <p className="text-[10px] text-slate-400">Scouts 2x candidate clips with audio + energy cues, then inspects each at 5 FPS to reject duds and trim cuts to 0.2s accuracy.</p>
+                      <p className="text-[10px] text-slate-400">Compare portrait and wide framing after the setup and payoff have been verified.</p>
                     </div>
                   </div>
                   <button
+                    aria-label="Check Highlight framing" aria-pressed={enableCloseupVerify}
                     onClick={() => setEnableCloseupVerify(!enableCloseupVerify)}
                     className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
                       enableCloseupVerify ? 'bg-cyan-500' : 'bg-slate-700'
@@ -1615,6 +1534,7 @@ export default function App() {
 
                 )}
 
+                {videoFormat === 'explainer' && <>
                 {/* Voiceover Pacing Mode */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 bg-[#0B0D12] rounded-xl border border-[#1F2430] mt-4 gap-3">
                   <div className="flex items-center gap-2.5">
@@ -1701,7 +1621,7 @@ export default function App() {
                       onChange={(e) => setSelectedCropMode(e.target.value as any)}
                       className="bg-[#141821] border border-[#1F2430] text-xs text-white rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-fuchsia-500 font-mono"
                     >
-                      <option value="center_zoom">Center Zoom (16:9 + Blur)</option>
+                      <option value="center_zoom">Centered Landscape + Blur</option>
                       <option value="facecam_split">Facecam Split (35% Cam)</option>
                       <option value="action_track">Action Track (Full 9:16)</option>
                     </select>
@@ -1719,6 +1639,7 @@ export default function App() {
 
 
 
+                </>}
                 {/* Video Cutter & AI Analysis Window */}
                 {videoFormat === 'explainer' ? (
                   <div className="bg-[#0B0D12] border border-[#1F2430] p-4 rounded-xl mt-3 space-y-2">
@@ -2274,7 +2195,7 @@ export default function App() {
                       <Video className="h-12 w-12 mx-auto mb-2 text-indigo-500/50" />
                       <p className="text-xs font-semibold text-slate-400">9:16 Vertical Canvas</p>
                       <p className="text-[10px] text-slate-500 font-mono mt-1">
-                        {activeClip ? `Mode: ${activeClip.crop_mode.toUpperCase()}` : '1080 x 1920'}
+                        {activeClip ? `Mode: ${activeClip.clip_type === 'ranked_highlight' ? 'RANKING' : activeClip.crop_mode.toUpperCase()}` : '1080 x 1920'}
                       </p>
                       {activeClip && (
                         <p className="text-[10px] text-indigo-400 font-semibold mt-2">
@@ -2350,7 +2271,7 @@ export default function App() {
                         <span className="text-indigo-300 font-bold">Senior Reviewer & Quality Gate</span>
                       </div>
                       <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
-                        {activeClip.verification_passed ? '✓ 5-FPS Verified' : '⭐ Rating'}: {activeClip.reviewer_score || activeClip.virality_score}/100
+                        {activeClip.library_ids?.length ? 'Reviewed footage' : activeClip.verification_passed ? '✓ 5-FPS Verified' : '⭐ Rating'}: {activeClip.reviewer_score || activeClip.virality_score}/100
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 leading-relaxed font-mono">
@@ -2358,13 +2279,15 @@ export default function App() {
                     </p>
                   </div>
 
+                  {activeClip.video_format==='explainer' && activeJobId && <button className="rounded-lg border border-indigo-500/50 px-3 py-2 text-xs font-bold text-indigo-200"
+                    onClick={()=>setPicker({role:'support',project:{job:activeJobId,clip:activeClip.clip_id,title:activeClip.hook_text,labels:(activeClip.beats || []).map(b=>b.label)}})}>Find supporting footage</button>}
                   {/* Story Beats Montage Breakdown */}
                   {activeClip.beats && activeClip.beats.length > 0 && (
                     <div className="bg-[#0B0D12] rounded-xl p-3 border border-purple-500/30 space-y-2">
                       <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
                         <div className="flex items-center gap-1.5">
                           <Layers className="h-3.5 w-3.5 text-purple-400" />
-                          <span className="text-white font-bold">Story Arc Montage ({activeClip.beats.length} Beats)</span>
+                          <span className="text-white font-bold">{activeClip.clip_type === 'ranked_highlight' ? 'Rank reveal order' : 'Story Arc Montage'} ({activeClip.beats.length})</span>
                         </div>
                         <span className="text-[10px] text-purple-300 font-mono">
                           {activeClip.duration}s total
@@ -2374,7 +2297,7 @@ export default function App() {
                         {activeClip.beats.map((beat, bIdx) => (
                           <div key={bIdx} className="bg-[#141821] border border-[#1F2430] rounded-lg p-2 flex items-center justify-between gap-2">
                             <div className="min-w-0">
-                              <p className="text-xs font-semibold text-slate-200 truncate">{beat.label}</p>
+                              <p className="text-xs font-semibold text-slate-200 truncate">{beat.rank ? `#${beat.rank} · ` : ''}{beat.label}</p>
                               {beat.description && (
                                 <p className="text-[10px] text-slate-400 truncate">{beat.description}</p>
                               )}
@@ -2405,6 +2328,7 @@ export default function App() {
                     </p>
                   </div>
 
+                  {activeClip.clip_type !== 'ranked_highlight' && <>
                   {/* AI Generated Commentary */}
                   <div className="bg-[#0B0D12] rounded-xl p-3 border border-[#1F2430]">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-300 mb-1.5">
@@ -2440,6 +2364,7 @@ export default function App() {
                     </p>
                   </div>
 
+                  </>}
                   {/* Automated Production Decisions */}
                   <div className="space-y-1.5">
                     <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400">
@@ -2448,7 +2373,7 @@ export default function App() {
                     <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
                       <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
                         <Check className="h-3 w-3 text-emerald-400 shrink-0" />
-                        <span className="truncate">9:16 {activeClip.crop_mode}</span>
+                        <span className="truncate">9:16 {activeClip.clip_type === 'ranked_highlight' ? 'Ranking' : activeClip.crop_mode}</span>
                       </div>
                       <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
                         <Check className="h-3 w-3 text-emerald-400 shrink-0" />
@@ -2456,7 +2381,7 @@ export default function App() {
                       </div>
                       <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
                         <Check className="h-3 w-3 text-emerald-400 shrink-0" />
-                        <span className="truncate">Hormozi Captions</span>
+                        <span className="truncate">{activeClip.clip_type === 'ranked_highlight' ? 'Rank labels' : 'Word captions'}</span>
                       </div>
                       <div className="bg-[#0B0D12] border border-[#1F2430] p-2 rounded-lg flex items-center gap-1.5 text-slate-300">
                         <Check className="h-3 w-3 text-emerald-400 shrink-0" />
@@ -2490,7 +2415,7 @@ export default function App() {
                         ) : (
                           <>
                             <Zap className="h-4 w-4 text-black" />
-                            <span>⚡ RENDER THIS MISSION SHORT ({activeClip.duration}s)</span>
+                            <span>Render {activeClip.clip_type === 'ranked_highlight' ? 'ranked highlight' : 'Short'} ({activeClip.duration}s)</span>
                           </>
                         )}
                       </button>
@@ -2528,372 +2453,10 @@ export default function App() {
           {/* ─────────────────────────────────────────────────────────────
               VIEW: COMPARISON STUDIO (GTA 5/4 vs GTA 6)
           ───────────────────────────────────────────────────────────── */}
+          <ComparisonBoard key={boardVersion} saved={savedSetup} onConsumed={()=>setSavedSetup(null)} onLibrary={()=>setPicker({role:'comparison'})} visible={activeTab === 'comparison'}
+            onRender={result => { setCompRenderResult(result); refreshSavedComparisons(); }} />
           {activeTab === 'comparison' && (
             <div className="max-w-7xl mx-auto space-y-6">
-              {/* Top Hero Banner */}
-              <div className="flex flex-col md:flex-row md:items-center justify-between bg-[#141821] border border-[#1F2430] rounded-2xl p-6 shadow-xl gap-4">
-                <div className="flex items-center gap-4">
-                  <div className="h-12 w-12 rounded-2xl bg-gradient-to-tr from-pink-600 to-cyan-400 p-0.5 shadow-lg shadow-pink-950/40 shrink-0">
-                    <div className="w-full h-full bg-[#0E1117] rounded-[14px] flex items-center justify-center">
-                      <Columns className="h-6 w-6 text-pink-400" />
-                    </div>
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-lg font-bold text-white tracking-wide">GTA Comparison Studio</h2>
-                      <span className="text-[10px] font-extrabold px-2 py-0.5 rounded bg-gradient-to-r from-pink-500 to-cyan-400 text-black font-mono">
-                        VICE CITY VS ENGINE
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Create viral comparison videos in 9:16 Shorts (Top/Bottom) or 16:9 Long (Side-by-Side) with neon gradient VS badges and Charon commentary.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Format & Game Toggles */}
-                <div className="flex flex-wrap items-center gap-3">
-                  {/* Game Toggle */}
-                  <div className="flex bg-[#0B0D12] p-1 rounded-xl border border-[#1F2430]">
-                    <button
-                      onClick={() => {
-                        setCompBaseGame('gta5');
-                        setCompHookText('GTA 5 VS GTA 6 • POLICE AI COMPARISON 🚨');
-                      }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                        compBaseGame === 'gta5'
-                          ? 'bg-purple-600/30 text-purple-200 border border-purple-500/50 shadow-sm'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      GTA V vs GTA VI
-                    </button>
-                    <button
-                      onClick={() => {
-                        setCompBaseGame('gta4');
-                        setCompHookText('GTA 4 VS GTA 6 • PHYSICS COMPARISON 🚨');
-                      }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                        compBaseGame === 'gta4'
-                          ? 'bg-amber-600/30 text-amber-200 border border-amber-500/50 shadow-sm'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      GTA IV vs GTA VI
-                    </button>
-                  </div>
-
-                  {/* Format Toggle */}
-                  <div className="flex bg-[#0B0D12] p-1 rounded-xl border border-[#1F2430]">
-                    <button
-                      onClick={() => setCompFormat('shorts_split')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all ${
-                        compFormat === 'shorts_split'
-                          ? 'bg-gradient-to-r from-pink-600/40 to-cyan-600/40 text-white border border-pink-500/50 shadow-sm'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      <Layers className="h-3.5 w-3.5 text-pink-400" />
-                      <span>📱 9:16 Shorts (Top/Bottom)</span>
-                    </button>
-                    <button
-                      onClick={() => setCompFormat('long_side_by_side')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all ${
-                        compFormat === 'long_side_by_side'
-                          ? 'bg-gradient-to-r from-pink-600/40 to-cyan-600/40 text-white border border-pink-500/50 shadow-sm'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      <Columns className="h-3.5 w-3.5 text-cyan-400" />
-                      <span>🖥️ 16:9 Long (Side-by-Side)</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Error Alert */}
-              {compRenderError && (
-                <div className="p-4 bg-rose-500/15 border border-rose-500/40 rounded-xl text-xs text-rose-300 flex items-start justify-between gap-3 shadow-lg shadow-rose-950/30">
-                  <div className="flex items-start gap-2.5">
-                    <AlertCircle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-bold text-white">Comparison Generation Note</p>
-                      <p className="text-[11px] text-rose-300/90 font-mono mt-0.5">{compRenderError}</p>
-                    </div>
-                  </div>
-                  <button onClick={() => setCompRenderError(null)} className="text-slate-400 hover:text-white">
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-              )}
-
-              {/* 3-Column Studio Grid */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-                {/* Column 1: GTA 6 YouTube Source */}
-                <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-5 space-y-4 shadow-xl">
-                  <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
-                    <div className="flex items-center gap-2">
-                      <div className="h-2.5 w-2.5 rounded-full bg-pink-500 animate-pulse" />
-                      <h3 className="text-sm font-bold text-white uppercase tracking-wider">1. GTA 6 Source (YouTube)</h3>
-                    </div>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-pink-500/20 text-pink-300 border border-pink-500/30 font-bold">
-                      VICE CITY
-                    </span>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      GTA 6 YouTube URL (Trailer, Leak, or Comparison)
-                    </label>
-                    <input
-                      type="text"
-                      value={compGta6Url}
-                      onChange={(e) => setCompGta6Url(e.target.value)}
-                      placeholder="https://youtu.be/..."
-                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500 font-mono"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-400 mb-1">
-                        Start Timestamp
-                      </label>
-                      <input
-                        type="text"
-                        value={compGta6StartTime}
-                        onChange={(e) => setCompGta6StartTime(e.target.value)}
-                        placeholder="00:00:40"
-                        className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-mono"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-400 mb-1">
-                        Duration (Sec)
-                      </label>
-                      <input
-                        type="number"
-                        value={compGta6Duration}
-                        onChange={(e) => setCompGta6Duration(Number(e.target.value))}
-                        min={5}
-                        max={60}
-                        className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-mono"
-                      />
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleGenerateQuest}
-                    disabled={isGeneratingQuest || !compGta6Url}
-                    className="w-full bg-gradient-to-r from-pink-600 to-indigo-600 hover:opacity-95 text-white font-bold py-2.5 px-4 rounded-xl shadow-lg shadow-pink-950/40 flex items-center justify-center gap-2 text-xs transition-all disabled:opacity-50"
-                  >
-                    {isGeneratingQuest ? (
-                      <>
-                        <span className="h-3 w-3 rounded-full bg-white animate-spin" />
-                        <span>Gemini Vision Scanning GTA 6...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="h-4 w-4 text-cyan-300" />
-                        <span>🔍 Scan GTA 6 & Get {compBaseGame.toUpperCase()} Quest</span>
-                      </>
-                    )}
-                  </button>
-
-                  <p className="text-[10px] text-slate-500 italic">
-                    Tip: If using comparison videos like ENXGMA, set GTA 6 start time to the 2nd half of the chapter (e.g. 00:00:40) and GTA 5 to the 1st half (e.g. 00:00:10).
-                  </p>
-                </div>
-
-                {/* Column 2: Gameplay Match Mission & Base Game Source */}
-                <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-5 space-y-4 shadow-xl">
-                  <div className="flex items-center justify-between pb-3 border-b border-[#1F2430]">
-                    <div className="flex items-center gap-2">
-                      <div className="h-2.5 w-2.5 rounded-full bg-purple-500 animate-pulse" />
-                      <h3 className="text-sm font-bold text-white uppercase tracking-wider">
-                        2. {compBaseGame === 'gta5' ? 'GTA V' : 'GTA IV'} Match Quest
-                      </h3>
-                    </div>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold">
-                      {compBaseGame === 'gta5' ? 'LOS SANTOS' : 'LIBERTY CITY'}
-                    </span>
-                  </div>
-
-                  {/* AI Mission Card Display */}
-                  {compQuest ? (
-                    <div className="bg-[#0B0D12] border border-cyan-500/30 rounded-xl p-3.5 space-y-2.5 shadow-sm">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[10px] font-mono text-cyan-400 uppercase font-bold tracking-wider">
-                          🎯 Mission Objective
-                        </span>
-                        <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/20 px-1.5 py-0.5 rounded">
-                          15s RECORDING
-                        </span>
-                      </div>
-                      <h4 className="text-xs font-bold text-white">{compQuest.test_title}</h4>
-                      <div className="text-[11px] text-slate-300 space-y-1 bg-[#141821] p-2 rounded-lg border border-[#1F2430]">
-                        <p className="text-amber-400 font-semibold">📍 Location: {compQuest.location}</p>
-                        <div className="space-y-0.5 pt-1">
-                          {(compQuest.gta5_steps || []).map((step: string, idx: number) => (
-                            <p key={idx} className="text-slate-300">• {step}</p>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-[#0B0D12] border border-dashed border-[#1F2430] rounded-xl p-3.5 text-center text-xs text-slate-400 space-y-1">
-                      <Bot className="h-5 w-5 text-indigo-400 mx-auto mb-1" />
-                      <p className="font-semibold text-slate-300">No Quest Generated Yet</p>
-                      <p className="text-[10px] text-slate-500">
-                        Click "Scan GTA 6" to let Gemini detect the exact mechanic and give you a 15-second recording checklist.
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Option A: Upload Local Recording */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1">
-                      Option A: Drop Your 15s {compBaseGame.toUpperCase()} Recording
-                    </label>
-                    <label className="flex flex-col items-center justify-center p-3.5 border-2 border-dashed border-[#1F2430] hover:border-purple-500/60 rounded-xl cursor-pointer bg-[#0B0D12] transition-colors">
-                      {isUploadingRec ? (
-                        <Loader2 className="h-5 w-5 text-purple-400 mb-1 animate-spin" />
-                      ) : (
-                        <UploadCloud className="h-5 w-5 text-purple-400 mb-1" />
-                      )}
-                      <span className="text-xs font-semibold text-slate-300">
-                        {isUploadingRec
-                          ? 'Uploading recording...'
-                          : compUploadedName
-                          ? `✓ ${compUploadedName}`
-                          : 'Upload local MP4 clip'}
-                      </span>
-                      <span className="text-[10px] text-slate-500">
-                        {compUploadedPath ? `Loaded: ${compUploadedPath}` : 'OBS, GeForce Experience, or screen recording'}
-                      </span>
-                      <input
-                        type="file"
-                        accept="video/mp4,video/quicktime,video/webm"
-                        onChange={handleUploadRecording}
-                        disabled={isUploadingRec}
-                        className="hidden"
-                      />
-                    </label>
-                  </div>
-
-                  {/* Option B: YouTube URL */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-1">
-                      Option B: Or {compBaseGame.toUpperCase()} YouTube URL
-                    </label>
-                    <input
-                      type="text"
-                      value={compBaseUrl}
-                      onChange={(e) => setCompBaseUrl(e.target.value)}
-                      placeholder="https://youtu.be/..."
-                      className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500 font-mono"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-400 mb-1">
-                        Start Timestamp
-                      </label>
-                      <input
-                        type="text"
-                        value={compBaseStartTime}
-                        onChange={(e) => setCompBaseStartTime(e.target.value)}
-                        placeholder="00:00:10"
-                        className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-mono"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-400 mb-1">
-                        Duration (Sec)
-                      </label>
-                      <input
-                        type="number"
-                        value={compBaseDuration}
-                        onChange={(e) => setCompBaseDuration(Number(e.target.value))}
-                        min={5}
-                        max={60}
-                        className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-mono"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {/* Column 3: Narration & Final 1-Click Compositor */}
-                <div className="bg-[#141821] rounded-2xl border border-[#1F2430] p-5 space-y-4 shadow-xl flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center justify-between pb-3 border-b border-[#1F2430] mb-3">
-                      <div className="flex items-center gap-2">
-                        <Volume2 className="h-4 w-4 text-cyan-400" />
-                        <h3 className="text-sm font-bold text-white uppercase tracking-wider">3. Comparison Narration</h3>
-                      </div>
-                      <select
-                        value={compTtsVoice}
-                        onChange={(e) => setCompTtsVoice(e.target.value)}
-                        className="bg-[#0B0D12] text-cyan-300 border border-[#1F2430] rounded px-2 py-0.5 text-[10px] font-mono focus:outline-none cursor-pointer"
-                      >
-                        <option value="Charon">🎙️ Charon (Lore)</option>
-                        <option value="Aoede">✨ Aoede (Female)</option>
-                        <option value="Kore">🌿 Kore (Calm)</option>
-                        <option value="Fenrir">⚡ Fenrir (Deep)</option>
-                        <option value="Puck">🔥 Puck (Fast)</option>
-                      </select>
-                    </div>
-
-                    <div className="space-y-3">
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Topic Headline (Top Banner)
-                        </label>
-                        <input
-                          type="text"
-                          value={compHookText}
-                          onChange={(e) => setCompHookText(e.target.value)}
-                          className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl px-3 py-2 text-xs text-white font-bold focus:outline-none focus:border-cyan-500"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Charon Documentary Comparison Script
-                        </label>
-                        <textarea
-                          rows={4}
-                          value={compCommentaryScript}
-                          onChange={(e) => setCompCommentaryScript(e.target.value)}
-                          className="w-full bg-[#0B0D12] border border-[#1F2430] rounded-xl p-2.5 text-xs text-slate-200 leading-relaxed focus:outline-none focus:border-cyan-500 resize-none font-sans"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="pt-3">
-                    <button
-                      onClick={handleRenderComparison}
-                      disabled={isRenderingComp || !compGta6Url || !compBaseUrl}
-                      className="w-full bg-gradient-to-r from-pink-500 via-purple-600 to-cyan-500 hover:opacity-95 text-white font-extrabold py-3 px-4 rounded-xl shadow-lg shadow-pink-950/40 flex items-center justify-center gap-2 text-xs transition-all tracking-wide disabled:opacity-50"
-                    >
-                      {isRenderingComp ? (
-                        <>
-                          <span className="h-3.5 w-3.5 rounded-full bg-white animate-spin" />
-                          <span>Rendering {compFormat === 'shorts_split' ? '9:16 Short' : '16:9 Long'} with VS Badge...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Zap className="h-4 w-4 text-amber-300" />
-                          <span>⚡ Render {compFormat === 'shorts_split' ? '9:16 Short' : '16:9 Long'} (Vice City VS)</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </div>
-
               {/* Saved Comparison Renders Gallery */}
               {savedComparisons.length > 0 && (
                 <div className="bg-[#141821] border border-[#1F2430] rounded-2xl p-4 space-y-3">
@@ -2943,7 +2506,7 @@ export default function App() {
                     </div>
                     <a
                       href={compRenderResult.preview_url}
-                      download={`GTA_${compBaseGame.toUpperCase()}_vs_GTA6_${compRenderResult.comp_id}.mp4`}
+                      download={`GTA_${(compRenderResult.base_game || 'gta5').toUpperCase()}_vs_GTA6_${compRenderResult.comp_id}.mp4`}
                       className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-4 rounded-xl flex items-center gap-2 text-xs transition-all shadow-md shadow-emerald-950/40"
                     >
                       <Download className="h-4 w-4" />
@@ -4672,7 +4235,7 @@ export default function App() {
               <h3 className="text-sm font-bold text-white">Confirm Complete Workspace Reset</h3>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              This will stop active pipeline jobs and permanently delete all downloaded raw videos, generated 9:16 clips, voiceovers, proxies, and job history.
+              This will stop active pipeline jobs and permanently delete all downloaded raw videos, generated 9:16 clips, voiceovers, proxies, saved footage, and job history.
             </p>
             <div className="flex items-center justify-end gap-2 pt-2">
               <button

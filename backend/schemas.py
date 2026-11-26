@@ -104,6 +104,9 @@ class SocialMetadata(BaseModel):
 # Clip & Director Plan Schemas
 # ------------------------------------------------------------------------------
 class StoryBeat(BaseModel):
+    rank: Optional[int] = Field(default=None, ge=1, le=5)
+    wide: bool = False
+    focus_x: float = Field(default=0.5, ge=0, le=1)
     beat_id: str = Field(..., description="Unique beat identifier (e.g., beat_1, setup, climax)")
     label: str = Field(..., description="Short punchy beat title (e.g. 'Mission Briefing', 'Infiltration', 'SWAT Ambush', 'Boat Escape')")
     start_time: float = Field(..., description="Start timestamp in seconds from raw video")
@@ -202,7 +205,7 @@ class CreateJobRequest(BaseModel):
     auto_cut_long_videos: bool = Field(default=True, description="Automatically cuts videos longer than 60 mins into safe segments under Gemini's token limit")
     long_video_strategy: LongVideoStrategy = Field(default=LongVideoStrategy.SEGMENT_HOPPER, description="Strategy for long videos: segment_hopper, full_vod_batch, or energy_peaks")
     game_volume_boost: float = Field(default=1.5, description="Audio boost multiplier for in-game sound effects (1.0 = Normal, 1.5 = Boosted SFX, 2.0 = High Impact)")
-    enable_closeup_verify: bool = Field(default=True, description="Run Stage 3 5-FPS close-up verification & frame-accurate trimming on scouted candidates")
+    enable_closeup_verify: bool = Field(default=True, description="Check the portrait framing of verified highlights. The setup and payoff are always reviewed.")
 
     @model_validator(mode="after")
     def enforce_explainer_requirements(self):
@@ -330,7 +333,23 @@ class ComparisonQuestRequest(BaseModel):
         self.target_language = TargetLanguage.ENGLISH
         return self
 
+class ComparisonNarration(BaseModel):
+    hook: str = Field(min_length=1, max_length=220)
+    older_game: str = Field(min_length=1, max_length=1000)
+    gta6: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def strip_passages(self):
+        for name in ("hook", "older_game", "gta6"):
+            passage = getattr(self, name).strip()
+            if not passage:
+                raise ValueError("Fill in all three parts of the comparison narration.")
+            setattr(self, name, passage)
+        return self
+
+
 class ComparisonRenderRequest(BaseModel):
+    library_id: Optional[str] = None
     quest_id: Optional[str] = None
     format: ComparisonFormat = ComparisonFormat.SHORTS_SPLIT
     base_game: ComparisonGame = ComparisonGame.GTA5
@@ -342,6 +361,7 @@ class ComparisonRenderRequest(BaseModel):
     base_game_duration_sec: float = 15.0
     hook_text: str = "GTA 5 VS GTA 6 • PHYSICS COMPARISON"
     commentary_script: Optional[str] = None
+    narration: Optional[ComparisonNarration] = None
     tts_voice: str = "Charon"
     caption_style: CaptionStyle = CaptionStyle.HORMOZI_YELLOW
 

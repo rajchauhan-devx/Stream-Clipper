@@ -1,7 +1,6 @@
 import asyncio
 import json
 import math
-import struct
 import shutil
 import tempfile
 import unittest
@@ -19,7 +18,7 @@ from backend.services.explainer import (
     Discovery, Explanation, ExplanationPlan, ExplanationReview, ExplainerScene,
     ExplainerService, Observation, SceneReview, output_duration_range, scan_windows,
     provider_schema,
-    NarrationRewrite,
+    CommentaryPassages,
 )
 from backend.services.gemini_director import GeminiDirectorService
 
@@ -121,6 +120,17 @@ class TestExplainer(unittest.TestCase):
         self.assertEqual(len(plan.clips), 1)
         self.assertEqual(watch.call_count, 1)  # Only close-up review; no repeated source scanning.
 
+    def test_conclusion_must_follow_context_and_have_observable_evidence(self):
+        reversed_roles = self.story.model_copy(deep=True)
+        reversed_roles.scenes[0].role = "conclusion"
+        reversed_roles.scenes[-1].role = "context"
+        with self.assertRaisesRegex(ValueError,"No complete explanation"):
+            self._run(story=reversed_roles)
+        no_evidence = self.review.model_copy(deep=True)
+        no_evidence.scenes[-1].observation = " "
+        with self.assertRaisesRegex(ValueError,"No complete explanation"):
+            self._run(review=no_evidence)
+
     def test_missing_scene_review_cannot_pass(self):
         review = self.review.model_copy(update={"scenes": self.review.scenes[:1]})
         with self.assertRaisesRegex(ValueError, "No complete explanation"):
@@ -189,56 +199,39 @@ class TestExplainer(unittest.TestCase):
         contents = self.director._generate_content_with_retry.call_args.args[2]
         self.assertEqual(contents[0].video_metadata.fps, 5)
 
-    def test_narration_starts_on_each_scene_boundary_without_extra_footage(self):
-        def synthesize(**kwargs):
-            frequency = 440 if kwargs["clip_id"].endswith("1") else 880
-            path = self.root / f"{frequency}.wav"
-            with wave.open(str(path), "wb") as audio:
-                audio.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-                audio.writeframes(b"".join(struct.pack("<h", int(5000 * math.sin(2 * math.pi * frequency * idx / 24000))) for idx in range(72000)))
-            return path
-        self.director.synthesize_voiceover.side_effect = synthesize
-        clip = {"clip_id": "clip_1", "commentary_script": "First scene. Second scene.", "beats": [
-            {"label": "Context", "duration": 4, "narration": "First scene."},
-            {"label": "Conclusion", "duration": 4, "narration": "Second scene."},
-        ]}
-        with patch("backend.services.explainer.ASSETS_DIR", self.root):
-            output = self.service.synthesize_narration(clip, "test")
+    def test_continuous_take_bridges_cut_and_compresses_long_pause(self):
         import numpy as np
-        with wave.open(str(output), "rb") as audio:
-            self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 8, places=2)
-            samples = np.frombuffer(audio.readframes(audio.getnframes()), dtype=np.int16)
-        for offset, expected in ((0.5, 440), (4.5, 880)):
-            snippet = samples[int(offset * 24000):int((offset + 0.5) * 24000)]
-            frequency = np.argmax(abs(np.fft.rfft(snippet))) * 24000 / len(snippet)
-            self.assertAlmostEqual(frequency, expected, delta=5)
-        # Three seconds of speech should finish before 2.9s at the gently brisk
-        # pace, retaining its pitch. Scene fitting must not stretch it to fill 4s.
-        for offset in (2.9, 6.9):
-            tail = samples[int(offset * 24000):int((offset + 0.1) * 24000)]
-            self.assertLess(np.max(np.abs(tail)), 10)
-        self.assertTrue(all(call.kwargs["require_speech"] for call in self.director.synthesize_voiceover.call_args_list))
-
-    def test_spoken_duration_feedback_shortens_narration_without_extending_scene(self):
-        def synthesize(**kwargs):
-            duration = 8 if len(kwargs['script'].split()) > 4 else 2
-            path = self.root / f"voice_{duration}.wav"
-            with wave.open(str(path), 'wb') as audio:
-                audio.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
-                audio.writeframes(b'\x00\x00' * (24000 * duration))
-            return path
-        self.director.synthesize_voiceover.side_effect = synthesize
-        clip = {'clip_id': 'clip_1', 'commentary_script': 'Michael checks the CCTV footage for evidence.', 'beats': [
-            {'label': 'CCTV clue', 'duration': 4, 'start_time': 118.5, 'narration': 'Michael checks the CCTV footage for evidence.', 'description': 'He examines the tablet.'},
+        tone = (5000 * np.sin(np.arange(72000) * 2 * np.pi * 440 / 24000)).astype("<i2")
+        voice = self.root / "take.wav"
+        with wave.open(str(voice), "wb") as audio:
+            audio.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            audio.writeframes(tone.tobytes() + bytes(48000) + tone.tobytes())
+        self.director.synthesize_voiceover.return_value = voice
+        clip = {"clip_id": "clip_1", "commentary_script": "First. Second.", "beats": [
+            {"duration": 4, "narration": "First."}, {"duration": 2.5, "narration": "Second."},
         ]}
-        with patch('backend.services.explainer.ASSETS_DIR', self.root), patch.object(self.service, '_request', return_value=NarrationRewrite(narration='Michael checks CCTV.')):
-            output = self.service.synthesize_narration(clip, 'test')
-        self.assertEqual(clip['commentary_script'], 'Michael checks CCTV.')
-        self.assertEqual(clip['beats'][0]['duration'], 4)
-        self.assertEqual(clip['beats'][0]['start_time'], 118.5)
-        self.assertEqual(self.director.synthesize_voiceover.call_count, 2)
-        with wave.open(str(output), 'rb') as audio:
-            self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 4, places=2)
+        joined = CommentaryPassages(passages=["Who took the phone?", "The footage gives a clue."])
+        with patch("backend.services.explainer.ASSETS_DIR", self.root), patch.object(self.service, "_request", return_value=joined):
+            output = self.service.synthesize_narration(clip, "test")
+        self.director.synthesize_voiceover.assert_called_once()
+        self.assertEqual(self.director.synthesize_voiceover.call_args.kwargs["script"], " ".join(joined.passages))
+        with wave.open(str(output)) as audio:
+            self.assertAlmostEqual(audio.getnframes() / 24000, 6.35, delta=0.06)
+            samples = np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2")
+        self.assertGreater(abs(samples[95000:97000]).mean(), 1000)
+        quiet = [abs(block).max() < 10 for block in np.array_split(samples, 300)]
+        from itertools import groupby
+        self.assertLess(max((sum(1 for _ in run) for silent, run in groupby(quiet) if silent), default=0), 20)
+
+    def test_invalid_rewrite_preserves_existing_verified_script(self):
+        clip = {"clip_id": "clip_1", "commentary_script": "Clue. Payoff.", "beats": [
+            {"duration": 4, "narration": "Clue."}, {"duration": 4, "narration": "Payoff."},
+        ]}
+        with patch.object(self.service, "_request", return_value=CommentaryPassages(passages=["One scene only."])):
+            with self.assertRaisesRegex(ValueError, "every verified scene"):
+                self.service.synthesize_narration(clip, "test")
+        self.assertEqual(clip["commentary_script"], "Clue. Payoff.")
+        self.director.synthesize_voiceover.assert_not_called()
 
     def test_pipeline_routes_explainer_with_absolute_source_timestamps(self):
         plan, _, _ = self._run()

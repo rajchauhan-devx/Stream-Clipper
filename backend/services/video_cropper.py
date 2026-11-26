@@ -290,6 +290,10 @@ class VideoCropper:
         webcam_corner: str = "top_right",
         progress_callback: Optional[Callable[[int, str], None]] = None,
         creator_regions: Optional[List[CreatorOverlayRegion]] = None,
+        rank_overlay: Optional[Path] = None,
+        rank_wide: bool = False,
+        focus_x: float = 0.5,
+        output_fps: int | None = None,
     ) -> Path:
         """
         Converts 16:9 gameplay to 1080x1920 (9:16) vertical using:
@@ -341,7 +345,15 @@ class VideoCropper:
 
         filter_args = []
 
-        if mode == CropMode.ACTION_TRACK:
+        if rank_overlay is not None:
+            if rank_wide:
+                frame = "scale=1080:1540:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            else:
+                frame = ("scale=1080:1540:force_original_aspect_ratio=increase,"
+                         f"crop=1080:1540:x='clip(iw*{focus_x}-540,0,iw-1080)':y=(ih-oh)/2")
+            graph = f"[0:v]{frame},pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=60[game];[game][1:v]overlay=0:0[v]"
+            filter_args = ["-framerate", "4", "-start_number", "0", "-i", str(rank_overlay), "-filter_complex", graph, "-map", "[v]"]
+        elif mode == CropMode.ACTION_TRACK:
             # Extract temporary segment to sample with YOLO
             temp_segment = self.temp_dir / f"sample_{output_cropped_path.stem}.mp4"
             subprocess.run([
@@ -392,8 +404,8 @@ class VideoCropper:
             vf = (
                 source_chain
                 + "[bg_in]scale=1080:1920:force_original_aspect_ratio=increase:flags=bicubic,crop=1080:1920,boxblur=30:5[bg];"
-                + "[fg_in]scale=1080:608:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:608:(ow-iw)/2:(oh-ih)/2[fg];"
-                + "[bg][fg]overlay=0:656,setsar=1[v_clean]"
+                + "[fg_in]scale=1080:700:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:700[fg];"
+                + "[bg][fg]overlay=0:(H-h)/2,setsar=1[v_clean]"
             )
             filter_args = ["-filter_complex", vf, "-map", "[v_clean]"]
 
@@ -403,6 +415,7 @@ class VideoCropper:
             "-t", str(duration),
             "-i", str(raw_video_path),
             *filter_args,
+            *(["-r", str(output_fps)] if output_fps else []),
             "-c:v", codec,
             *encoder_args,
             "-an",  # Audio will be handled by audio_processor and renderer
@@ -411,8 +424,14 @@ class VideoCropper:
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0 or not output_cropped_path.exists() or output_cropped_path.stat().st_size < 1000:
-            if rectangles:
-                raise RuntimeError(f"Protected crop failed; refusing an unmasked fallback: {result.stderr[-1000:]}")
+            if rank_overlay is not None and codec != "libx264":
+                encoder_index = cmd.index("-c:v")
+                cpu_cmd = [*cmd[:encoder_index], "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                           "-an", str(output_cropped_path)]
+                subprocess.run(cpu_cmd, check=True, capture_output=True)
+                return output_cropped_path
+            if rectangles or rank_overlay is not None:
+                raise RuntimeError(f"Composited crop failed; refusing an unmasked fallback: {result.stderr[-1000:]}")
             logger.warning(f"FFmpeg crop failed or produced empty file: {result.stderr[:200] if result else ''}. Falling back to center crop.")
             # Fallback to simple center crop if complex filter fails
             fallback_cmd = [
@@ -421,6 +440,7 @@ class VideoCropper:
                 "-t", str(duration),
                 "-i", str(raw_video_path),
                 "-vf", "crop=in_h*9/16:in_h,scale=1080:1920",
+                *(["-r", str(output_fps)] if output_fps else []),
                 "-c:v", codec,
                 *encoder_args,
                 "-an",

@@ -38,3 +38,4 @@ workspace/comparisons_db.json
 # OS Specific
 .DS_Store
 Thumbs.db
+workspace/footage-library.sqlite3*

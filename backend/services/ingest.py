@@ -81,7 +81,8 @@ class IngestService:
         self,
         url_or_path: str,
         job_id: str,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        reuse_cached_prefix: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Fetches raw 1080p MP4 from YouTube or prepares local file.
@@ -139,6 +140,10 @@ class IngestService:
                 if progress_callback:
                     progress_callback(25, f"Using fast cached 1080p stream ({cached_path.name})...")
                 logger.info(f"Reusing cached raw video for {url_or_path}: {cached_path}")
+                # A comparison board references a persistent source and its seekable preview.
+                if (reuse_cached_prefix and cached_path.name.startswith(reuse_cached_prefix)
+                        and cached_path.resolve().parent == self.downloads_dir.resolve()):
+                    output_raw_path = cached_path
                 if cached_path.resolve() != output_raw_path.resolve():
                     self._link_or_copy(cached_path, output_raw_path)
                 meta = self._get_video_metadata(output_raw_path)

@@ -207,6 +207,8 @@ class TestStreamClipper(unittest.TestCase):
         self.assertTrue(facecam_vid.exists())
         self.assertGreater(facecam_vid.stat().st_size, 1000)
 
+        race_title = self.tmp_dir / "race-title.png"
+        renderer.write_comparison_title("How do planes fly in GTA V vs GTA VI?", race_title)
         comp_short = self.tmp_dir / "comp_short.mp4"
         renderer.render_comparison_clip(
             base_video_path=raw_vid,
@@ -216,7 +218,7 @@ class TestStreamClipper(unittest.TestCase):
             comparison_format="shorts_split",
             base_game="gta5",
             ass_subtitles_path=ass_file,
-            topic_banner_path=banner_png,
+            title_path=race_title,
         )
         self.assertTrue(comp_short.exists())
         self.assertGreater(comp_short.stat().st_size, 1000)
@@ -230,7 +232,7 @@ class TestStreamClipper(unittest.TestCase):
             comparison_format="long_side_by_side",
             base_game="gta4",
             ass_subtitles_path=ass_file,
-            topic_banner_path=banner_png,
+            title_path=race_title,
         )
         self.assertTrue(comp_long.exists())
         self.assertGreater(comp_long.stat().st_size, 1000)

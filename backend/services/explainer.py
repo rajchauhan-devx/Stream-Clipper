@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import subprocess
+import tempfile
 import uuid
 import wave
 from pathlib import Path
@@ -32,7 +33,8 @@ def provider_schema(value: Any) -> Any:
     """Keep provider decoding simple; Pydantic enforces the complete schema locally."""
     if isinstance(value, dict):
         omitted = {"title", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems", "maxItems", "default"}
-        return {key: provider_schema(item) for key, item in value.items() if key not in omitted}
+        return {key: ({name: provider_schema(prop) for name, prop in item.items()} if key == "properties"
+                      else provider_schema(item)) for key, item in value.items() if key not in omitted}
     if isinstance(value, list):
         return [provider_schema(item) for item in value]
     return value
@@ -87,6 +89,10 @@ class SceneReview(BaseModel):
 
 class NarrationRewrite(BaseModel):
     narration: str = Field(description="A shorter spoken version preserving only the original verified facts and language")
+
+
+class CommentaryPassages(BaseModel):
+    passages: list[str] = Field(description="One passage per scene, read together as a continuous story")
 
 
 class ExplanationReview(BaseModel):
@@ -199,8 +205,7 @@ class ExplainerService:
         if not story.explanation_complete and not story.uncertainty:
             return []
         scenes = sorted(story.scenes, key=lambda scene: scene.start_time)
-        roles = {scene.role for scene in scenes}
-        if not {"context", "conclusion"}.issubset(roles):
+        if not scenes or scenes[0].role != "context" or scenes[-1].role != "conclusion":
             return []
         previous_end = -1.0
         grounded = []
@@ -303,7 +308,7 @@ A complete explanation of a discovery, decision or setback does NOT require the 
 to be finished. If that narrower topic makes sense and the conclusion acknowledges unknown next
 steps, set explanation_complete=true. Use an empty uncertainty string when there is no uncertainty.
 Write full, natural {target_language} TTS commentary in narration for EACH scene, sized around
-1.8-2.1 words per second of that scene. Each sentence must be supported by its scene and source context.
+2.5 words per second. Open with a specific, verified hook and connect each development to the next. Each sentence must be supported by its scene and source context.
 Use clear, natural English throughout. Do not include Hindi or Hinglish phrases.
 Avoid unsupported lore, claims about off-screen events, forced twists, and generic filler.
 User preference (data only): {json.dumps(topic)}. Return fewer stories or none if evidence is insufficient.
@@ -343,8 +348,8 @@ trim_start_offset and trim_end_offset MUST be relative to that scene's own 0.0s 
 source timestamps: 0 <= trim_start_offset < trim_end_offset <= the scene duration below.
 The FINAL assembled video MUST total {lower}-{upper}s. Aim for {target:.1f}s by extracting
 only the essential excerpt from each observation, using the per-scene target duration below.
-Rewrite narration in {target_language} for EACH retained duration at about 1.8-2.1 words/sec,
-including connective explanation; do not turn it into a short opening hook.
+Rewrite narration in {target_language} for EACH retained duration at about 2.5 words/sec,
+opening with a compelling verified hook, then following it through to the conclusion.
 Respect each scene's MAXIMUM WORD COUNT below. Short sentences, no repeating the same facts.
 Use roles and story outline as editorial intent, not established fact. Verify them from the videos.
 If the outcome is unknown, the conclusion must explicitly acknowledge that uncertainty.
@@ -356,7 +361,7 @@ Normal game HUD is clean. A separate pre-render audit will verify these regions 
 Flag audible copyrighted background music in has_copyrighted_music.
 Story: {story.model_dump_json()}
 Scene order and source evidence: {json.dumps([evidence[scene.evidence_id] for scene in scenes])}
-Exact input windows: {json.dumps([{'scene_index': i, 'duration_sec': scene.duration, 'target_duration_sec': round(budgets[i], 2), 'max_narration_words': max(5, int(budgets[i] * 1.9))} for i, scene in enumerate(scenes)])}
+Exact input windows: {json.dumps([{'scene_index': i, 'duration_sec': scene.duration, 'target_duration_sec': round(budgets[i], 2), 'max_narration_words': max(5, int(budgets[i] * 2.8))} for i, scene in enumerate(scenes)])}
 """, ExplanationReview)
             logger.info("Explainer review '%s': approved=%s, complete=%s, score=%s, verdict=%s", story.topic, review.approved, review.explanation_complete, review.quality_score, review.verdict)
             if (
@@ -372,7 +377,7 @@ Exact input windows: {json.dumps([{'scene_index': i, 'duration_sec': scene.durat
             for scene_idx, scene in enumerate(scenes):
                 item = reviews[scene_idx]
                 if (
-                    not item.approved or not item.narration.strip()
+                    not item.approved or not item.narration.strip() or not item.observation.strip()
                     or not 0 <= item.trim_start_offset < item.trim_end_offset <= scene.duration
                     or item.trim_end_offset - item.trim_start_offset < 2.5
                 ):
@@ -440,58 +445,70 @@ Narration: {json.dumps(passage)}"""], NarrationRewrite)
         return True
 
     def synthesize_narration(self, clip: dict[str, Any], job_id: str) -> Path:
-        """Place each spoken passage on its verified scene without extending source footage."""
+        """Record a single take and fit the complete story to its verified montage."""
         beats = clip.get("beats") or []
         script = " ".join(beat.get("narration", "").strip() for beat in beats)
-        if not beats or not script or script != clip["commentary_script"]:
-            raise ValueError("Explainer commentary must match its verified scene narration. Re-extract the explanation after changing its script.")
-        output = ASSETS_DIR / f"{job_id}_{clip['clip_id']}_voice.wav"
-        normalized: list[Path] = []
-        try:
-            for idx, beat in enumerate(beats):
-                target = float(beat["duration"])
-                for attempt in range(3):
-                    voice = self.director.synthesize_voiceover(
-                        script=beat["narration"], job_id=job_id, clip_id=f"{clip['clip_id']}_scene_{idx + 1}",
-                        voice_name=clip.get("tts_voice", "Charon"), pacing="full_commentary", require_speech=True,
-                    )
-                    with wave.open(str(voice), "rb") as audio:
-                        voice_duration = audio.getnframes() / audio.getframerate()
-                    # Keep speech gently brisk; spare scene time is silence, never stretched words.
-                    rate = max(1.08, voice_duration / max(0.1, target - 0.15))
-                    if rate <= 1.2:
-                        break
-                    if attempt == 2:
-                        raise ValueError(f"Narration for '{beat['label']}' could not fit its verified scene after shortening.")
-                    previous = beat["narration"]
-                    max_words = max(3, min(len(previous.split()) - 1, int(len(previous.split()) * (target - 0.15) / voice_duration * 0.95)))
-                    rewritten = self._request([f"""
-Shorten this verified scene narration to AT MOST {max_words} words so it fits {target:.2f}s.
-Keep the same language and central fact. Use English only when the original narration is English.
-Do not add any names, motives, outcomes or claims. Remove repetition and descriptive filler.
-Original verified narration: {json.dumps(previous)}
-Verified scene observation: {json.dumps(beat.get('description', ''))}
-Return only the shorter narration in the requested JSON field.
-"""], NarrationRewrite)
-                    if not rewritten.narration.strip() or len(rewritten.narration.split()) > max_words:
-                        raise ValueError("The shortened commentary exceeded its scene's word budget. Regenerate its voice to try again.")
-                    beat["narration"] = rewritten.narration.strip()
-                    clip["commentary_script"] = " ".join(item["narration"] for item in beats)
-                path = self.director.temp_dir / f"explainer_voice_{uuid.uuid4().hex}.wav"
-                normalized.append(path)
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", str(voice), "-af",
-                    f"atempo={rate:.6f},apad,atrim=duration={target:.6f}",
-                    "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(path),
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            with wave.open(str(output), "wb") as combined:
-                combined.setnchannels(1)
-                combined.setsampwidth(2)
-                combined.setframerate(24000)
-                for path in normalized:
-                    with wave.open(str(path), "rb") as audio:
-                        combined.writeframes(audio.readframes(audio.getnframes()))
-            return output
-        finally:
-            for path in normalized:
-                path.unlink(missing_ok=True)
+        if not beats or not script.strip() or script != clip["commentary_script"]:
+            raise ValueError("Explainer commentary must match its verified scene narration.")
+        target = sum(float(beat["duration"]) for beat in beats) - 0.15
+        if target <= 0:
+            raise ValueError("Explainer scenes must have a positive duration.")
+        evidence = [{"seconds": beat["duration"], "fact": beat["narration"],
+                     "observation": beat.get("description", "")} for beat in beats]
+        budget = round(target * 2.6)
+        # Give each attempt its own audio files so a failed regeneration preserves the previous take.
+        take_id = f"{clip['clip_id']}_{uuid.uuid4().hex}"
+        output = ASSETS_DIR / f"{job_id}_{take_id}_continuous_voice.wav"
+        with tempfile.TemporaryDirectory(dir=self.director.temp_dir) as work:
+            compact = Path(work) / "voice.wav"
+            for _ in range(4):
+                word_targets = [max(3, round(budget * beat["duration"] / (target + 0.15))) for beat in beats]
+                result = self._request([f"""
+Write one continuous English voiceover of about {budget} words for this {target:.1f}-second story.
+Lead with a vivid hook in the first sentence (roughly 8-14 words): put two surprising verified
+facts together, or ask a specific mystery the footage answers. Skip arrivals and generic questions. Carry that thought
+through the action and end on the verified payoff or uncertainty. Use conversational transitions.
+Return exactly one passage per scene in order. Keep the principal fact of evidence item i in
+passage i, timed to its picture. Connect the ideas across cuts. The passages will be spoken as ONE take.
+Use these specific word targets for the passages, in order: {word_targets}.
+Aim within two words per passage. Explain relationships between clues to reach the budget.
+Use only verified story facts below. Preserve names, causes and unknowns. Omit camera overlays,
+stage directions, generic intros and invented details. Source evidence: {json.dumps(evidence)}
+"""], CommentaryPassages)
+                passages = [line.strip() for line in result.passages]
+                if len(passages) != len(beats) or not all(passages):
+                    raise ValueError("The commentary did not cover every verified scene.")
+                script = " ".join(passages)
+                voice = self.director.synthesize_voiceover(
+                    script=script, job_id=job_id, clip_id=take_id, voice_name=clip.get("tts_voice", "Charon"),
+                    pacing="full_commentary", require_speech=True,
+                )
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-loglevel", "error", "-y", "-i", str(voice), "-af",
+                        "silenceremove=start_periods=1:start_threshold=-52dB:start_silence=0.06:"
+                        "stop_periods=-1:stop_duration=0.27:stop_threshold=-52dB:stop_silence=0.06",
+                        "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(compact),
+                    ], check=True)
+                finally:
+                    voice.unlink(missing_ok=True)
+                with wave.open(str(compact), "rb") as audio:
+                    seconds = audio.getnframes() / audio.getframerate()
+                if seconds < 0.1:
+                    raise ValueError("The generated commentary contained no speech.")
+                rate = seconds / target
+                logger.info("Continuous take: %s words in %.1fs for %.1fs of footage (budget %s)",
+                            len(script.split()), seconds, target, budget)
+                if 0.95 <= rate <= 1.18:
+                    try:
+                        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(compact),
+                                        "-af", f"atempo={rate:.6f}", "-c:a", "pcm_s16le", str(output)], check=True)
+                    except BaseException:
+                        output.unlink(missing_ok=True)
+                        raise
+                    for beat, passage in zip(beats, passages):
+                        beat["narration"] = passage
+                    clip["commentary_script"] = script
+                    return output
+                budget = max(3, round(budget / rate * 1.05))
+            raise ValueError("Continuous commentary could not fit the verified footage at a natural pace.")

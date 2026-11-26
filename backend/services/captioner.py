@@ -34,25 +34,13 @@ class CaptionerService:
             centisecs = 99
         return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
-    def generate_ass_subtitles(
+    def transcribe_words(
         self,
         audio_path: Path,
-        output_ass_path: Path,
-        style: CaptionStyle = CaptionStyle.HORMOZI_YELLOW,
         target_language: str = "english",
         initial_prompt: Optional[str] = None,
-        play_res_x: int = 1080,
-        play_res_y: int = 1920,
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> Path:
-        """
-        Transcribes voiceover with word-level timestamps and generates
-        a styled .ass subtitle file placed safely above the Shorts/Reels bottom overlay.
-        """
-        if progress_callback:
-            progress_callback(45, "Generating word-level ASS captions with active highlighting...")
-
-        logger.info(f"Generating captions from {audio_path} in style {style.value} (lang={target_language})...")
+    ) -> List[Dict[str, Any]]:
+        """Return real spoken words and timestamps without subtitle fallbacks."""
         model = self._get_whisper()
 
         lang_key = str(target_language or "english").lower()
@@ -89,6 +77,29 @@ class CaptionerService:
             import torch
             torch.cuda.empty_cache()
         gc.collect()
+
+        return words_data
+
+    def generate_ass_subtitles(
+        self,
+        audio_path: Path,
+        output_ass_path: Path,
+        style: CaptionStyle = CaptionStyle.HORMOZI_YELLOW,
+        target_language: str = "english",
+        initial_prompt: Optional[str] = None,
+        play_res_x: int = 1080,
+        play_res_y: int = 1920,
+        progress_callback: Optional[Callable[[int, str], None]] = None
+    ) -> Path:
+        """
+        Transcribes voiceover with word-level timestamps and generates
+        a styled .ass subtitle file placed safely above the Shorts/Reels bottom overlay.
+        """
+        if progress_callback:
+            progress_callback(45, "Generating word-level ASS captions with active highlighting...")
+
+        logger.info(f"Generating captions from {audio_path} in style {style.value} (lang={target_language})...")
+        words_data = self.transcribe_words(audio_path, target_language, initial_prompt)
 
         # If whisper didn't catch words (e.g. synthetic test tone), create a fallback line
         if not words_data:

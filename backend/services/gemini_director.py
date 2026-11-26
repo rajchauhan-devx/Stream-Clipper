@@ -1232,11 +1232,11 @@ REQUIRED FIELDS:
   * Step 3: What to record for 10-15 seconds.
 - recommended_duration_sec: 15.0
 - hook_text: Irresistible uppercase topic headline banner with emoji (e.g. "{target_base} VS GTA 6 • POLICE AI 🚨" or "{target_base} VS GTA 6 • TIRE PHYSICS 💥")
-- commentary_script: A viral 4-sentence comparison script in {target_language.upper()} (~70 to 95 words) formatted for calm, authoritative narrator Charon:
-  * Sentence 1 (Hook): Compelling curiosity question on Rockstar's engine evolution.
-  * Sentence 2 (Older Game): How {target_base} handled this mechanic.
-  * Sentence 3 (GTA 6 Next-Gen): The subtle, realistic improvement in GTA 6.
-  * Sentence 4 (Call to Action / Question): Engaging question asking viewers which game did it better.
+- commentary_script: Exactly three newline-separated narration passages in natural {target_language.upper()}.
+  * Line 1: One short spoken question naming the action and both games, such as "How do planes fly in {target_base} versus GTA 6?"
+  * Line 2: One or two sentences about what to watch during the {target_base}-only phase. The older clip has not been seen. Describe the test without claiming an outcome.
+  * Line 3: One or two sentences about what this footage actually shows during the GTA 6-only phase.
+  * Do not include line labels, extra lines or a sign-off. Keep each game's passage short enough for its clip.
 - base_game: "{base_game}"
 - social_metadata: YouTube Shorts, Instagram Reels, and Facebook Reels titles and tags.
 """
@@ -1292,7 +1292,11 @@ REQUIRED FIELDS:
             ],
             recommended_duration_sec=15.0,
             hook_text=f"{target_name} VS GTA 6 • POLICE AI 🚨",
-            commentary_script=f"How did Rockstar completely revolutionize police behavior from {target_name} to GTA 6? In {target_name}, standing anywhere near a law enforcement officer immediately triggered aggressive lethal gunfire with zero warning. But in GTA 6, police AI first attempts verbal de-escalation, only drawing weapons if genuinely threatened. Which game's reaction feels more realistic to you?",
+            commentary_script=(
+                f"How do police react in {target_name} versus GTA 6?\n"
+                f"First, watch how the officers respond in the {target_name} clip.\n"
+                "Now watch the officers in the GTA 6 clip and compare how they respond."
+            ),
             base_game=ComparisonGame.GTA5 if "5" in base_game else ComparisonGame.GTA4,
             social_metadata=SocialMetadata(
                 youtube=YouTubeMetadata(

@@ -36,6 +36,9 @@ from backend.services.ingest import parse_time_str
 from backend.services.video_cropper import video_cropper
 from backend.services.audio_processor import audio_processor
 from backend.services.captioner import captioner_service
+from backend.services import comparison_board, ranked_highlight, footage_library
+from backend.services.comparison import ComparisonTimeline, commentary_passages
+from backend.services.comparison_motion import COMPARISON_ASSETS, spoken_logo_frames, write_logo_motion
 from backend.services.renderer import video_renderer
 from backend.services.publishers.youtube_pub import youtube_publisher
 from backend.services.publishers.meta_pub import meta_publisher
@@ -393,18 +396,23 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     req = job["request"]
     clip_num = clip_idx + 1
 
-    english_service = ExplainerService(gemini_director)
-    migrated_english = await asyncio.to_thread(english_service.ensure_english_narration, clip)
-    if migrated_english or not clip.get("voice_path"):
-        if clip.get("video_format") == VideoFormat.EXPLAINER:
-            voice = await asyncio.to_thread(english_service.synthesize_narration, clip, job_id)
-        else:
-            voice = await asyncio.to_thread(
-                gemini_director.synthesize_voiceover, clip["commentary_script"], job_id, clip_id,
-                voice_name=clip.get("tts_voice", "Charon"), pacing=req.get("voiceover_pacing", "full_commentary"),
-                require_speech=True,
-            )
-        clip["voice_path"] = str(voice)
+    ranked = clip.get("clip_type") == "ranked_highlight"
+    if not ranked:
+        english_service = ExplainerService(gemini_director)
+        migrated_english = await asyncio.to_thread(english_service.ensure_english_narration, clip)
+        legacy_explainer_voice = clip.get("video_format") == VideoFormat.EXPLAINER and not str(
+            clip.get("voice_path", "")
+        ).endswith("_continuous_voice.wav")
+        if migrated_english or legacy_explainer_voice or not clip.get("voice_path"):
+            if clip.get("video_format") == VideoFormat.EXPLAINER:
+                voice = await asyncio.to_thread(english_service.synthesize_narration, clip, job_id)
+            else:
+                voice = await asyncio.to_thread(
+                    gemini_director.synthesize_voiceover, clip["commentary_script"], job_id, clip_id,
+                    voice_name=clip.get("tts_voice", "Charon"), pacing=req.get("voiceover_pacing", "full_commentary"),
+                    require_speech=True,
+                )
+            clip["voice_path"] = str(voice)
     req["target_language"] = "english"
 
     raw_path_str = job["metadata"].get("raw_path")
@@ -445,17 +453,18 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     raw_dur = float(job["metadata"].get("duration", 0.0))
     use_raw_offset = bool(raw_path and raw_path.exists())
     max_source_dur = raw_dur if (use_raw_offset and raw_dur > 0) else cut_dur_sec
-    orig_voice_path = Path(clip["voice_path"])
     norm_voice_tmp = TEMP_DIR / f"{job_id}_{clip_id}_voice_sync.wav"
-    if clip.get("video_format") == VideoFormat.EXPLAINER:
+    if ranked:
+        sync_voice_path = None
+    elif clip.get("video_format") == VideoFormat.EXPLAINER:
         if not clip.get("verification_passed"):
             raise ValueError("This explanation has not passed scene verification.")
-        # Explainer speech is already aligned per scene. Never append unverified footage.
-        sync_voice_path = orig_voice_path
+        # Continuous commentary is already fitted to the montage. Never append unverified footage.
+        sync_voice_path = Path(clip["voice_path"])
     else:
         sync_voice_path, beats_list, clip_dur = await asyncio.to_thread(
             _synchronize_voice_and_render_span,
-            orig_voice_path,
+            Path(clip["voice_path"]),
             beats_list,
             clip_dur,
             start_time,
@@ -480,14 +489,27 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     else:
         selected_windows = [(start_time, clip_dur)]
 
+    # Saved footage keeps original source coordinates, including when a draft mixes several videos.
+    beat_sources = [source_path] * len(selected_windows)
+    for idx, beat in enumerate(beats_list):
+        if beat.get("source_asset"):
+            beat_sources[idx] = comparison_board.asset_path(beat["source_asset"])
+            selected_windows[idx] = (beat["start_time"], beat["duration"])
+    if len(selected_windows) == 1:
+        source_path = beat_sources[0]
+        start_time, clip_dur = selected_windows[0]
+    regions_by_source = {}
     creator_regions = []
     if req.get("enable_watermark_masker", True):
         if progress_callback:
             progress_callback(f"Clip {clip_num}/{total_clips}: Checking all scenes for creator cameras and branding...")
-        audit = await asyncio.to_thread(audit_creator_overlays, gemini_director, source_path, selected_windows)
-        clip["watermark_info"] = audit.model_dump(mode="json")
-        creator_regions = audit.regions
-        if creator_regions and crop_mode == CropMode.FACECAM_SPLIT:
+        for path in dict.fromkeys(beat_sources):
+            windows = [window for path_here, window in zip(beat_sources, selected_windows) if path == path_here]
+            audit = await asyncio.to_thread(audit_creator_overlays, gemini_director, path, windows)
+            regions_by_source[path] = audit.regions
+            clip["watermark_info"] = audit.model_dump(mode="json")
+        creator_regions = regions_by_source.get(source_path, [])
+        if any(regions_by_source.values()) and crop_mode == CropMode.FACECAM_SPLIT:
             crop_mode = CropMode.CENTER_ZOOM
         save_jobs_db()
         # Source-coordinate masks replace decorative badges and label-dependent blur.
@@ -507,22 +529,38 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
             b_cropped = TEMP_DIR / f"{job_id}_{clip_id}_beat_{b_idx}_cropped.mp4"
             b_audio = TEMP_DIR / f"{job_id}_{clip_id}_beat_{b_idx}_audio.wav"
 
+            rank_args = {}
+            if ranked:
+                beat = beats_list[b_idx]
+                art = TEMP_DIR / f"{job_id}_{clip_id}_rank_{b_idx}_%d.png"
+                game = clip.get("ranking_game", clip["hook_text"]).removeprefix("Ranking Funniest ").removesuffix(" Moments")
+                plates = [Path(str(art) % frame) for frame in (0, 1)]
+                for frame, plate in enumerate(plates):
+                    await asyncio.to_thread(ranked_highlight.artwork, beats_list, b_idx, game, plate, reveal=bool(frame),
+                                            title=clip["hook_text"] if clip.get("ranking_title") else "")
+                rank_args = {"rank_overlay": art, "rank_wide": beat.get("wide", False), "focus_x": beat.get("focus_x", 0.5)}
+            if clip.get("library_ids"):
+                rank_args["output_fps"] = 60
             await asyncio.to_thread(
                 video_cropper.crop_to_vertical,
-                raw_video_path=source_path,
+                raw_video_path=beat_sources[b_idx],
                 start_time=act_start,
                 duration=b_dur,
                 output_cropped_path=b_cropped,
                 mode=crop_mode,
                 mask_webcam=mask_webcam,
                 webcam_corner=webcam_corner,
-                creator_regions=creator_regions,
+                creator_regions=regions_by_source.get(beat_sources[b_idx], creator_regions),
+                **rank_args,
             )
+            if ranked:
+                for plate in plates:
+                    plate.unlink(missing_ok=True)
             beat_v_paths.append(b_cropped)
 
             await asyncio.to_thread(
                 _extract_audio_or_silence,
-                source_path,
+                beat_sources[b_idx],
                 b_audio,
                 b_dur,
                 act_start,
@@ -589,7 +627,7 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
     # 3. Strip Copyright Radio or Streamer Mic Voice via Demucs AI
     should_strip_voice = (
         req.get("strip_streamer_voice", True)
-        or req.get("voiceover_pacing") == "full_commentary"
+        or (not ranked and req.get("voiceover_pacing") == "full_commentary")
         or (req.get("copyright_guard", True) and clip.get("has_copyrighted_music", False))
     )
     if should_strip_voice:
@@ -599,35 +637,39 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
         await asyncio.to_thread(audio_processor.strip_copyright_radio, seg_audio, clean_audio)
         seg_audio = clean_audio
 
-    # 4. Duck and Mix Gameplay Audio under TTS Voiceover
-    if progress_callback:
-        progress_callback(f"Clip {clip_num}/{total_clips}: Mixing sidechain ducked audio (-16dB)...")
-    voice_path = sync_voice_path
     mixed_audio_path = TEMP_DIR / f"{job_id}_{clip_id}_mixed.wav"
-    game_boost = float(req.get("game_volume_boost", 1.5))
-    await asyncio.to_thread(
-        audio_processor.duck_and_mix_audio,
-        seg_audio,
-        voice_path,
-        mixed_audio_path,
-        -16.0,
-        game_boost
-    )
+    ass_path = None
+    if ranked:
+        await asyncio.to_thread(ranked_highlight.mix_sound, seg_audio, beats_list, mixed_audio_path, float(req.get("game_volume_boost", 1.5)))
+    else:
+        # 4. Duck and Mix Gameplay Audio under TTS Voiceover
+        if progress_callback:
+            progress_callback(f"Clip {clip_num}/{total_clips}: Mixing sidechain ducked audio (-16dB)...")
+        voice_path = sync_voice_path
+        game_boost = float(req.get("game_volume_boost", 1.5))
+        await asyncio.to_thread(
+            audio_processor.duck_and_mix_audio,
+            seg_audio,
+            voice_path,
+            mixed_audio_path,
+            -16.0,
+            game_boost
+        )
 
-    # 5. Generate Word-Level ASS Subtitles
-    if progress_callback:
-        progress_callback(f"Clip {clip_num}/{total_clips}: Aligning word-level animated subtitles...")
-    ass_path = TEMP_DIR / f"{job_id}_{clip_id}_captions.ass"
-    caption_style = CaptionStyle(clip.get("caption_style", "hormozi_yellow"))
-    target_lang = str(req.get("target_language", "english"))
-    await asyncio.to_thread(
-        captioner_service.generate_ass_subtitles,
-        voice_path,
-        ass_path,
-        style=caption_style,
-        target_language=target_lang,
-        initial_prompt=str(clip.get("commentary_script") or ""),
-    )
+        # 5. Generate Word-Level ASS Subtitles
+        if progress_callback:
+            progress_callback(f"Clip {clip_num}/{total_clips}: Aligning word-level animated subtitles...")
+        ass_path = TEMP_DIR / f"{job_id}_{clip_id}_captions.ass"
+        caption_style = CaptionStyle(clip.get("caption_style", "hormozi_yellow"))
+        target_lang = str(req.get("target_language", "english"))
+        await asyncio.to_thread(
+            captioner_service.generate_ass_subtitles,
+            voice_path,
+            ass_path,
+            style=caption_style,
+            target_language=target_lang,
+            initial_prompt=str(clip.get("commentary_script") or ""),
+        )
 
     # 6. Final Hardware Burn-in Render (M4 VideoToolbox / RTX 3050 NVENC)
     if progress_callback:
@@ -638,7 +680,7 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
 
     # Generate attractive Top Topic Headline Banner if enabled
     topic_banner_path = None
-    if req.get("enable_topic_header", True):
+    if not ranked and req.get("enable_topic_header", True):
         hook_text = clip.get("hook_text") or clip.get("hook_summary") or f"{tag_prefix} GAMEPLAY"
         hook_upper = hook_text.upper()
         if any(w in hook_upper for w in ["SECRET", "MYTH", "VAULT", "CARTEL", "LOST", "MYSTERY"]):
@@ -679,6 +721,8 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
 
     clip["rendered_video_path"] = str(final_mp4)
     clip["preview_url"] = f"/workspace/renders/{final_mp4.name}?v={int(time.time())}"
+    if clip.get("library_ids"):
+        clip["used_library_ids"] = list(clip["library_ids"])
     clip["status"] = "rendered"
     save_jobs_db()
 
@@ -801,38 +845,10 @@ async def execute_job_pipeline(job_id: str):
 
             job["metadata"] = meta
 
-            # Step 2: Stage 1 Signal Scan + Audio-Enabled 480p Proxy
-            await send_progress(31, "Stage 1: Scanning audio energy spikes & scene cuts...", JobStatus.INGESTING)
-            timeline_signals = await asyncio.to_thread(
-                ingest_service.extract_timeline_signals,
-                video_path=cut_path,
-                progress_callback=lambda p, m: sync_cb(p, m, JobStatus.INGESTING)
-            )
-
-            await send_progress(32, "Generating 480p audio-enabled proxy for Gemini Vision...", JobStatus.INGESTING)
-            proxy_path = await asyncio.to_thread(
-                ingest_service.create_lightweight_proxy,
-                raw_video_path=cut_path,
-                job_id=job_id,
-                progress_callback=lambda p, m: sync_cb(p, m, JobStatus.INGESTING)
-            )
-            job["proxy_path"] = str(proxy_path)
-
-            # Step 3: Stages 2 & 3 — Scout Over-Selection + 5-FPS Close-Up Verification & Trim
-            await send_progress(52, "Stage 2: Gemini Vision watching + listening to gameplay & scouting candidates...", JobStatus.ANALYZING)
             plan = await asyncio.to_thread(
-                gemini_director.analyze_gameplay_and_plan,
-                proxy_path=proxy_path,
-                source_title=meta.get("title", f"GTA6_{job_id}"),
-                target_language=req.target_language.value,
-                clip_count=req.clip_count,
-                clip_length_range=req.clip_length_range,
-                voiceover_pacing=req.voiceover_pacing.value if hasattr(req, "voiceover_pacing") else "full_commentary",
-                preferred_voice=getattr(req, "tts_voice", "Charon"),
-                source_video_path=Path(cut_path),
-                timeline_signals=timeline_signals,
-                enable_closeup_verify=getattr(req, "enable_closeup_verify", True),
-                progress_callback=lambda p, m: sync_cb(p, m, JobStatus.ANALYZING)
+                ranked_highlight.analyze, gemini_director, Path(raw_path), meta.get("title", "Gameplay"),
+                meta["cut_start_sec"], meta["cut_duration_sec"], req.clip_count, req.clip_length_range,
+                req.enable_closeup_verify, lambda p, m: sync_cb(p, m, JobStatus.ANALYZING),
             )
         job["plan"] = plan.model_dump()
         job["clips"] = [c.model_dump() for c in plan.clips]
@@ -853,31 +869,12 @@ async def execute_job_pipeline(job_id: str):
             if getattr(req, "tts_voice", None):
                 clip_dict["tts_voice"] = req.tts_voice
 
-        # Step 4: Synthesize Voiceovers & Callout Graphics
-        enable_overlays = getattr(req, "enable_callout_overlay", False)
-        voice_message = "Generating full commentary aligned to verified scenes..." if req.video_format == VideoFormat.EXPLAINER else "Generating spoken hook voiceovers..."
-        await send_progress(70, voice_message, JobStatus.VOICING)
-        pacing_val = req.voiceover_pacing.value if hasattr(req, "voiceover_pacing") else "full_commentary"
-        for i, clip in enumerate(job["clips"]):
-            clip_id = clip["clip_id"]
-            chosen_voice = clip.get("tts_voice") or getattr(req, "tts_voice", "Charon")
-            if req.video_format == VideoFormat.EXPLAINER:
-                voice_path = await asyncio.to_thread(
-                    ExplainerService(gemini_director).synthesize_narration, clip, job_id,
-                )
-            else:
-                voice_path = await asyncio.to_thread(
-                    gemini_director.synthesize_voiceover,
-                    script=clip["commentary_script"],
-                    job_id=job_id,
-                    clip_id=clip_id,
-                    voice_name=chosen_voice,
-                    pacing=pacing_val
-                )
-            clip["voice_path"] = str(voice_path)
-
-            # Keep overlay_path null to prevent callout rectangle box popups
-            clip["overlay_path"] = None
+        if req.video_format == VideoFormat.EXPLAINER:
+            await send_progress(70, "Generating full commentary aligned to verified scenes...", JobStatus.VOICING)
+            for clip in job["clips"]:
+                voice_path = await asyncio.to_thread(ExplainerService(gemini_director).synthesize_narration, clip, job_id)
+                clip["voice_path"] = str(voice_path)
+                clip["overlay_path"] = None
 
         # Step 5: Check Operating Mode (Manual Topic Selection vs Autonomous Batch Render)
         total_clips = len(job["clips"])
@@ -886,7 +883,7 @@ async def execute_job_pipeline(job_id: str):
             logger.info(f"Job {job_id} is in MANUAL_STUDIO mode. {total_clips} topics extracted for user review.")
             await send_progress(
                 100,
-                f"Discovered {total_clips} verified explanations. Review and select which ones to render in Studio." if req.video_format == VideoFormat.EXPLAINER else f"Discovered {total_clips} real mission topics! Review and select which ones to render in Studio.",
+                f"Discovered {total_clips} verified explanations. Review and select which ones to render in Studio." if req.video_format == VideoFormat.EXPLAINER else f"Discovered {total_clips} ranked compilations. Review the moments and render in Studio.",
                 JobStatus.COMPLETED,
                 {"clips": job["clips"], "plan": job["plan"], "metadata": job.get("metadata", {})}
             )
@@ -1122,6 +1119,9 @@ async def reset_pipeline(payload: Optional[ResetPipelineRequest] = None):
             })
 
     if delete_all:
+        with footage_library.db() as conn:
+            conn.execute("DELETE FROM moments")
+            conn.execute("DELETE FROM sources")
         JOBS_DB.clear()
         save_jobs_db()
         COMPARISONS_DB.clear()
@@ -1194,6 +1194,8 @@ async def regenerate_voice(job_id: str, clip_id: str):
     if not target_clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
+    if target_clip.get("clip_type") == "ranked_highlight":
+        raise HTTPException(400, "Ranked highlights use gameplay audio and reveal sounds.")
     req = job.get("request") or {}
     pacing = req.get("voiceover_pacing", "full_commentary")
     await asyncio.to_thread(ExplainerService(gemini_director).ensure_english_narration, target_clip)
@@ -1462,6 +1464,59 @@ async def get_export_pack(job_id: str, clip_id: str):
 # Comparison Studio Endpoints (GTA 5/4 vs GTA 6)
 # ------------------------------------------------------------------------------
 
+app.include_router(footage_library.router)
+
+
+@app.get("/api/library")
+def get_library():
+    result = footage_library.catalogue()
+    uses = {}
+    for job in list(JOBS_DB.values()):
+        for clip in job.get("clips", []):
+            for key in clip.get("used_library_ids", []):
+                uses.setdefault(key, []).append({"title": clip["hook_text"], "url": clip["preview_url"]})
+    for export in list(COMPARISONS_DB):
+        if export.get("library_id"):
+            uses.setdefault(export["library_id"], []).append({"title": export["hook_text"], "url": export["preview_url"]})
+    for item in result["moments"]:
+        item["uses"] = uses.get(item["id"], [])
+    return result
+
+
+def store_library_job(job):
+    JOBS_DB[job["job_id"]] = job
+    save_jobs_db()
+    return job
+
+
+@app.post("/api/library/projects")
+async def build_saved_project(payload: footage_library.Lineup):
+    return store_library_job(await asyncio.to_thread(footage_library.make_job, payload))
+
+
+@app.post("/api/library/projects/{job_id}/{clip_id}/support")
+async def insert_support(job_id: str, clip_id: str, payload: footage_library.Insert):
+    job = JOBS_DB.get(job_id, {})
+    clip = next((c for c in job.get("clips", []) if c["clip_id"] == clip_id), None)
+    if not clip:
+        raise HTTPException(404, "Commentary project not found.")
+    return store_library_job(await asyncio.to_thread(footage_library.with_support, job, clip, payload))
+
+
+app.include_router(comparison_board.router)
+
+
+@app.post("/api/comparison/render-pair")
+async def render_reviewed_pair(payload: comparison_board.BoardRenderRequest):
+    if payload.library_id:
+        item = (await asyncio.to_thread(footage_library.selected, [payload.library_id]))[0]
+        if item["asset"] != payload.gta6.asset:
+            raise HTTPException(422, "Saved setup and reference source differ.")
+    request = await asyncio.to_thread(comparison_board.prepare_render, payload)
+    request.library_id = payload.library_id
+    return await render_comparison_endpoint(request)
+
+
 @app.post("/api/comparison/generate-quest", response_model=ComparisonQuest)
 async def generate_comparison_quest_endpoint(payload: ComparisonQuestRequest):
     """
@@ -1549,6 +1604,7 @@ async def upload_comparison_recording(file: UploadFile = File(...)):
         return {
             "status": "success",
             "file_path": str(dest_path),
+            "asset": dest_path.name,
             "filename": raw_name,
             "preview_url": f"/workspace/downloads/{dest_path.name}"
         }
@@ -1564,9 +1620,9 @@ async def upload_comparison_recording(file: UploadFile = File(...)):
 async def render_comparison_endpoint(payload: ComparisonRenderRequest):
     """
     Renders Top/Bottom (9:16 Shorts) or Side-by-Side (16:9 Long) comparison video
-    with custom Vice City Gradient 'VS' badge and Charon commentary narration.
+    with a centered VS mark and spoken commentary.
     """
-    comp_id = f"comp_{int(time.time())}"
+    comp_id = f"comp_{uuid.uuid4().hex[:12]}"
     temp_files_to_clean = []
 
     try:
@@ -1588,39 +1644,45 @@ async def render_comparison_endpoint(payload: ComparisonRenderRequest):
         gta6_raw = await resolve_video(payload.gta6_url_or_path, "gta6")
         base_raw = await resolve_video(payload.base_game_url_or_path, "base")
 
-        # 2. Voiceover synthesis FIRST so clip duration never chops off Charon mid-sentence
-        script = payload.commentary_script or f"How did Rockstar revolutionize game physics from {payload.base_game.value.upper()} to GTA 6? Watch closely as the physics and AI react completely differently in each game."
-        voice_path = await asyncio.to_thread(
-            gemini_director.synthesize_voiceover,
-            script=script,
-            job_id=comp_id,
-            clip_id="comp",
-            voice_name=payload.tts_voice,
-            pacing="full_commentary"
-        )
-        temp_files_to_clean.append(voice_path)
-
-        voice_meta = await asyncio.to_thread(ingest_service._get_video_metadata, voice_path)
-        voice_dur = 0.0
-        try:
-            probe_out = subprocess.check_output(
-                [
-                    "ffprobe", "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(voice_path),
-                ],
-                text=True,
-            ).strip()
-            voice_dur = float(probe_out)
-        except Exception:
-            voice_dur = float(voice_meta.get("duration") or 0.0)
+        # Generate the spoken hook and game passages separately to get exact switch times.
+        passages = commentary_passages(payload)
+        script = " ".join(passages)
+        voices = []
+        durations = []
+        for label, passage in zip(("hook", "older", "six"), passages):
+            voice = await asyncio.to_thread(
+                gemini_director.synthesize_voiceover,
+                script=passage,
+                job_id=comp_id,
+                clip_id=label,
+                voice_name=payload.tts_voice,
+                pacing="full_commentary",
+                require_speech=True,
+            )
+            temp_files_to_clean.append(voice)
+            voices.append(voice)
+            durations.append(await asyncio.to_thread(_probe_audio_duration, voice))
+        if min(durations) <= 0:
+            raise RuntimeError("Could not measure the comparison narration.")
 
         gta6_dur = max(5.0, min(60.0, payload.gta6_duration_sec))
         base_dur = max(5.0, min(60.0, payload.base_game_duration_sec))
-        comp_dur = round(min(58.0, max(gta6_dur, base_dur, voice_dur + 1.8)), 2)
+        if durations[0] >= min(base_dur, gta6_dur):
+            raise HTTPException(status_code=400, detail="Shorten the spoken hook or select longer clips.")
+        timeline = ComparisonTimeline.from_durations(*durations, base_dur, gta6_dur)
+        hook_words = await asyncio.to_thread(captioner_service.transcribe_words, voices[0], initial_prompt=passages[0])
+        logo_frames = spoken_logo_frames(hook_words, payload.base_game.value, timeline.hook)
+        slide_frame = max(timeline.hook, *(frame + 16 for frame in logo_frames if frame is not None), 0)
+        logo_movies = {}
+        for game, frame in zip((payload.base_game.value, "gta6"), logo_frames):
+            if frame is None:
+                continue
+            movie = TEMP_DIR / f"{comp_id}_{game}_logo.mov"
+            temp_files_to_clean.append(movie)
+            await asyncio.to_thread(write_logo_motion, COMPARISON_ASSETS / f"{game}.png", movie, frame, slide_frame)
+            logo_movies[game] = movie
+        logger.info("Comparison %s logo pops at frames %s, slide starts at %s", comp_id, logo_frames, slide_frame)
 
-        # 3. Trim both clips synchronously to `comp_dur`
         async def trim_clip(src_path: Path, start_str: str, dur_sec: float, tag: str) -> Path:
             out_clip = TEMP_DIR / f"{comp_id}_{tag}_trimmed.mp4"
             temp_files_to_clean.append(out_clip)
@@ -1636,28 +1698,20 @@ async def render_comparison_endpoint(payload: ComparisonRenderRequest):
             await asyncio.to_thread(subprocess.run, cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return out_clip
 
-        gta6_trimmed = await trim_clip(gta6_raw, payload.gta6_start_time, comp_dur, "gta6")
-        base_trimmed = await trim_clip(base_raw, payload.base_game_start_time, comp_dur, "base")
+        gta6_trimmed = await trim_clip(gta6_raw, payload.gta6_start_time, gta6_dur, "gta6")
+        base_trimmed = await trim_clip(base_raw, payload.base_game_start_time, base_dur, "base")
 
-        # 4. Duck base game audio under voiceover (generate silence if base clip has no audio stream)
-        mixed_audio = TEMP_DIR / f"{comp_id}_mixed.wav"
-        temp_files_to_clean.append(mixed_audio)
+        # Keep each game's sound with its moving panel. Use the older game's audio during the hook.
         base_audio = TEMP_DIR / f"{comp_id}_base_audio.wav"
-        temp_files_to_clean.append(base_audio)
-        await asyncio.to_thread(
-            _extract_audio_or_silence,
-            base_trimmed,
-            base_audio,
-            comp_dur,
-        )
-        await asyncio.to_thread(
-            audio_processor.duck_and_mix_audio,
-            base_audio,
-            voice_path,
-            mixed_audio,
-            -16.0,
-            1.4
-        )
+        gta6_audio = TEMP_DIR / f"{comp_id}_gta6_audio.wav"
+        voice_path = TEMP_DIR / f"{comp_id}_narration.wav"
+        gameplay = TEMP_DIR / f"{comp_id}_gameplay.wav"
+        mixed_audio = TEMP_DIR / f"{comp_id}_mixed.wav"
+        temp_files_to_clean.extend([base_audio, gta6_audio, voice_path, gameplay, mixed_audio])
+        await asyncio.to_thread(_extract_audio_or_silence, base_trimmed, base_audio, base_dur)
+        await asyncio.to_thread(_extract_audio_or_silence, gta6_trimmed, gta6_audio, gta6_dur)
+        await asyncio.to_thread(timeline.assemble_audio, voices, base_audio, gta6_audio, voice_path, gameplay)
+        await asyncio.to_thread(audio_processor.duck_and_mix_audio, gameplay, voice_path, mixed_audio, -16.0, 1.4)
 
         # 5. Generate word-level ASS subtitles
         ass_path = TEMP_DIR / f"{comp_id}_captions.ass"
@@ -1673,18 +1727,10 @@ async def render_comparison_endpoint(payload: ComparisonRenderRequest):
             play_res_y=1080 if is_landscape_comp else 1920,
         )
 
-        # 6. Generate Top Topic Banner
-        base_tag = "GTA V" if "5" in payload.base_game.value or "v" in payload.base_game.value.lower() else "GTA IV"
-        topic_banner = await asyncio.to_thread(
-            video_renderer.generate_topic_banner,
-            hook_text=payload.hook_text,
-            job_id=comp_id,
-            clip_id="comp",
-            category_tag=f"{base_tag} VS GTA VI • COMPARISON"
-        )
-        temp_files_to_clean.append(topic_banner)
+        title_path = TEMP_DIR / f"{comp_id}_title.png"
+        temp_files_to_clean.append(title_path)
+        await asyncio.to_thread(video_renderer.write_comparison_title, payload.hook_text.strip() or passages[0], title_path)
 
-        # 7. Final Compositor Render (Shorts 9:16 or Long 16:9)
         final_mp4 = RENDERS_DIR / f"{comp_id}_comparison_{payload.format.value}.mp4"
         await asyncio.to_thread(
             video_renderer.render_comparison_clip,
@@ -1695,9 +1741,14 @@ async def render_comparison_endpoint(payload: ComparisonRenderRequest):
             comparison_format=payload.format.value,
             base_game=payload.base_game.value,
             ass_subtitles_path=ass_path,
-            topic_banner_path=topic_banner
+            timeline=timeline,
+            logo_frames=logo_frames,
+            logo_movies=logo_movies,
+            slide_frame=slide_frame,
+            title_path=title_path,
         )
 
+        base_tag = "GTA V" if payload.base_game.value == "gta5" else "GTA IV"
         result_payload = {
             "status": "completed",
             "comp_id": comp_id,
@@ -1725,10 +1776,14 @@ async def render_comparison_endpoint(payload: ComparisonRenderRequest):
                 }
             }
         }
+        if payload.library_id:
+            result_payload["library_id"] = payload.library_id
         COMPARISONS_DB.append(result_payload)
         save_comparisons_db()
         return result_payload
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error rendering comparison: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
