@@ -120,21 +120,30 @@ def media_info(path: Path) -> tuple[float, str]:
     raise HTTPException(422, "Choose a readable video with at least five seconds of footage.")
 
 
-def describe_asset(path: Path) -> dict:
+def browser_preview_path(path: Path) -> Path:
+    return config.PROXIES_DIR / f"{path.name}.av-preview.mp4"
+
+
+def prepare_browser_preview(path: Path) -> str:
+    preview = browser_preview_path(path)
+    if not preview.exists():
+        with TemporaryDirectory(dir=config.PROXIES_DIR) as tmp:
+            output = Path(tmp) / "preview.mp4"
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
+                            "-map", "0:a:0?", "-c:a", "aac", "-b:a", "96k", "-vf", "scale=-2:480", "-c:v", "libx264", "-preset", "veryfast",
+                            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)], check=True)
+            output.replace(preview)
+    return f"/workspace/proxies/{quote(preview.name)}"
+
+
+def describe_asset(path: Path, *, build_preview: bool = True) -> dict:
     duration, codec = media_info(path)
+    url = None
     if path.suffix.lower() == ".mp4" and codec == "h264":
         url = f"/workspace/downloads/{quote(path.name)}"
-    else:
+    elif build_preview or browser_preview_path(path).is_file():
         # Browsers cannot reliably seek in every supported capture format.
-        preview = config.PROXIES_DIR / f"{path.name}.av-preview.mp4"
-        if not preview.exists():
-            with TemporaryDirectory(dir=config.PROXIES_DIR) as tmp:
-                output = Path(tmp) / "preview.mp4"
-                subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
-                                "-map", "0:a:0?", "-c:a", "aac", "-b:a", "96k", "-vf", "scale=-2:480", "-c:v", "libx264", "-preset", "veryfast",
-                                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)], check=True)
-                output.replace(preview)
-        url = f"/workspace/proxies/{quote(preview.name)}"
+        url = prepare_browser_preview(path)
     return {"asset": path.name, "preview_url": url, "duration": duration, "windows": window_count(duration)}
 
 
@@ -226,10 +235,13 @@ def youtube_id(address: str) -> str:
 
 @router.post("/source")
 def open_source(request: SourceRequest):
-    video_id = youtube_id(request.url)
+    return load_source(youtube_id(request.url))
+
+
+def load_source(video_id: str, progress_callback=None, *, build_preview: bool = True):
     meta = ingest_service.download_or_link_video(f"https://youtu.be/{video_id}", f"scan_{uuid.uuid4().hex}",
-                                                 reuse_cached_prefix="scan_")
-    return {**describe_asset(Path(meta["raw_path"])), "title": meta.get("title") or video_id}
+                                                 progress_callback=progress_callback, reuse_cached_prefix="scan_")
+    return {**describe_asset(Path(meta["raw_path"]), build_preview=build_preview), "title": meta.get("title") or video_id}
 
 
 @router.post("/recording")

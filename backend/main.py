@@ -8,6 +8,7 @@ import logging
 import asyncio
 import threading
 import subprocess
+from contextlib import nullcontext
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import FileResponse
@@ -729,7 +730,7 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
 # ------------------------------------------------------------------------------
 # Asynchronous Job Execution Pipeline
 # ------------------------------------------------------------------------------
-async def execute_job_pipeline(job_id: str):
+async def execute_job_pipeline(job_id: str, library_source: dict | None = None):
     """Orchestrates Phase 2 & Phase 3 End-to-End Pipeline"""
     if job_id not in JOBS_DB:
         return
@@ -762,13 +763,16 @@ async def execute_job_pipeline(job_id: str):
 
     try:
         # Step 1: Ingest Raw Video
-        await send_progress(5, "Connecting to YouTube stream via yt-dlp...", JobStatus.INGESTING)
-        meta = await asyncio.to_thread(
-            ingest_service.download_or_link_video,
-            url_or_path=req.url_or_path,
-            job_id=job_id,
-            progress_callback=lambda p, m: sync_cb(p, m, JobStatus.INGESTING)
-        )
+        if library_source is not None:
+            meta = dict(library_source)
+        else:
+            await send_progress(5, "Connecting to YouTube stream via yt-dlp...", JobStatus.INGESTING)
+            meta = await asyncio.to_thread(
+                ingest_service.download_or_link_video,
+                url_or_path=req.url_or_path,
+                job_id=job_id,
+                progress_callback=lambda p, m: sync_cb(p, m, JobStatus.INGESTING)
+            )
         job["metadata"] = meta
         raw_path = meta["raw_path"]
 
@@ -788,6 +792,7 @@ async def execute_job_pipeline(job_id: str):
                 topic=req.explainer_topic, scan_start=meta["scan_start_sec"],
                 window_seconds=(req.cut_duration_mins or 10.0) * 60,
                 progress_callback=lambda p, m: sync_cb(p, m, JobStatus.ANALYZING),
+                main_story=library_source is not None,
             )
             meta["selection_summary"] = plan.overall_analysis
             job["metadata"] = meta
@@ -1027,7 +1032,10 @@ async def update_settings(payload: SettingsUpdateRequest):
 
 @app.post("/api/jobs")
 async def create_job(request: CreateJobRequest):
-    import uuid
+    return queue_job(request)
+
+
+def queue_job(request: CreateJobRequest, library_source: dict | None = None):
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
     job_entry = {
@@ -1044,7 +1052,7 @@ async def create_job(request: CreateJobRequest):
     save_jobs_db()
     logger.info(f"Created new job: {job_id} [Mode: {request.mode}]")
 
-    task = asyncio.create_task(execute_job_pipeline(job_id))
+    task = asyncio.create_task(execute_job_pipeline(job_id, library_source))
     ACTIVE_TASKS[job_id] = task
 
     return {
@@ -1073,35 +1081,35 @@ async def reset_pipeline(payload: Optional[ResetPipelineRequest] = None):
             ACTIVE_TASKS.pop(jid, None)
             cancelled_jobs.append(jid)
 
-    # 2. Terminate only ffmpeg/yt-dlp child processes belonging to this workspace/job
-    try:
-        import sys
-        target_needle = req_job_id if (not delete_all and req_job_id) else str(WORKSPACE_DIR)
-        if sys.platform == "win32":
-            # Only terminate if full reset and matching workspace path via PowerShell CIM
-            ps_filter = target_needle.replace("'", "''")
-            ps_cmd = (
-                f"Get-CimInstance Win32_Process | Where-Object {{ "
-                f"($_.Name -eq 'ffmpeg.exe' -or $_.Name -eq 'yt-dlp.exe') -and "
-                f"$_.CommandLine -like '*{ps_filter}*' }} | "
-                f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-            )
-            subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
-        else:
-            pgrep_res = subprocess.run(["pgrep", "-af", "ffmpeg|yt-dlp"], capture_output=True, text=True)
-            for line in (pgrep_res.stdout or "").splitlines():
-                parts = line.split(None, 1)
-                if len(parts) == 2 and target_needle in parts[1]:
-                    try:
-                        os.kill(int(parts[0]), 9)
-                    except ProcessLookupError:
-                        pass
-        logger.info(f"Terminated scoped child processes matching '{target_needle}'.")
-    except Exception as e:
-        logger.warning(f"Error terminating child processes: {e}")
+    with footage_library.resetting_catalogue() if delete_all else nullcontext():
+        # 2. Terminate only ffmpeg/yt-dlp child processes belonging to this workspace/job
+        try:
+            import sys
+            target_needle = req_job_id if (not delete_all and req_job_id) else str(WORKSPACE_DIR)
+            if sys.platform == "win32":
+                ps_filter = target_needle.replace("'", "''")
+                ps_cmd = (
+                    f"Get-CimInstance Win32_Process | Where-Object {{ "
+                    f"($_.Name -eq 'ffmpeg.exe' -or $_.Name -eq 'yt-dlp.exe') -and "
+                    f"$_.CommandLine -like '*{ps_filter}*' }} | "
+                    f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+                )
+                subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+            else:
+                pgrep_res = subprocess.run(["pgrep", "-af", "ffmpeg|yt-dlp"], capture_output=True, text=True)
+                for line in (pgrep_res.stdout or "").splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) == 2 and target_needle in parts[1]:
+                        try:
+                            os.kill(int(parts[0]), 9)
+                        except ProcessLookupError:
+                            pass
+            logger.info(f"Terminated scoped child processes matching '{target_needle}'.")
+        except Exception as e:
+            logger.warning(f"Error terminating child processes: {e}")
 
-    # 3. Clean files from downloads, proxies, renders, assets, and temp folders
-    freed_bytes = clean_workspace_files(job_id=req_job_id, delete_all=delete_all)
+        # 3. Clean files from downloads, proxies, renders, assets, and temp folders
+        freed_bytes = clean_workspace_files(job_id=req_job_id, delete_all=delete_all)
     freed_mb = round(freed_bytes / (1024 * 1024), 2)
 
     # 4. Broadcast cancellation to WebSocket clients and update job states
@@ -1119,9 +1127,6 @@ async def reset_pipeline(payload: Optional[ResetPipelineRequest] = None):
             })
 
     if delete_all:
-        with footage_library.db() as conn:
-            conn.execute("DELETE FROM moments")
-            conn.execute("DELETE FROM sources")
         JOBS_DB.clear()
         save_jobs_db()
         COMPARISONS_DB.clear()
@@ -1492,6 +1497,16 @@ def store_library_job(job):
 @app.post("/api/library/projects")
 async def build_saved_project(payload: footage_library.Lineup):
     return store_library_job(await asyncio.to_thread(footage_library.make_job, payload))
+
+
+@app.post("/api/library/sources/{source_id}/story")
+async def build_source_story(source_id: str):
+    source = footage_library.full_story_source(source_id)
+    request = CreateJobRequest(
+        url_or_path=f"https://youtu.be/{source_id}", mode="manual_studio", video_format=VideoFormat.EXPLAINER,
+        clip_count=1, cut_duration_mins=5,
+    )
+    return queue_job(request, source)
 
 
 @app.post("/api/library/projects/{job_id}/{clip_id}/support")

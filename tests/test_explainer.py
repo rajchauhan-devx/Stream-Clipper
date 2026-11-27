@@ -49,7 +49,7 @@ class TestExplainer(unittest.TestCase):
             ],
         )
 
-    def _run(self, review=None, story=None, keep_cache=False):
+    def _run(self, review=None, story=None, keep_cache=False, **analysis_options):
         if not keep_cache:
             shutil.rmtree(self.root / "explainer_scan_cache", ignore_errors=True)
         discoveries = [
@@ -62,7 +62,7 @@ class TestExplainer(unittest.TestCase):
             patch.object(self.service, "_watch", side_effect=[review or self.review] if keep_cache else [*discoveries, review or self.review]) as watch,
             patch.object(self.service, "_request", return_value=ExplanationPlan(stories=[story or self.story])) as request,
         ):
-            plan = self.service.analyze(self.source, "Mission", clip_count=1, window_seconds=600)
+            plan = self.service.analyze(self.source, "Mission", clip_count=1, window_seconds=600, **analysis_options)
         return plan, watch, request
 
     def test_windows_cover_whole_source_with_boundary_overlap(self):
@@ -157,6 +157,17 @@ class TestExplainer(unittest.TestCase):
         self.assertTrue(plan.clips[0].verification_passed)
         self.assertIn("later rescue", plan.clips[0].hook_summary)
 
+    def test_main_story_checks_the_full_source_and_rejects_an_unresolved_outcome(self):
+        plan, watch, request = self._run(main_story=True, scan_start=120)
+        self.assertEqual(watch.call_args_list[0].args[1], [(0, 600)])
+        self.assertEqual([beat.start_time for beat in plan.clips[0].beats], [5, 1110])
+        self.assertIn("An opening scene, subplot, or isolated encounter cannot substitute", request.call_args.args[0][0])
+        self.assertIn("Whole-source evidence", watch.call_args.args[3])
+
+        incomplete = self.review.model_copy(update={"uncertainty": "The escape outcome is unknown.", "uncertainty_acknowledged": True})
+        with self.assertRaisesRegex(ValueError, "No complete main story"):
+            self._run(review=incomplete, main_story=True)
+
     def test_overlong_evidence_is_trimmed_by_reviewer_into_requested_duration(self):
         observations = [Observation(topic="A decision", role=role, start_time=start, end_time=start + 20, description="Supporting source evidence.")
                         for role, start in (("context", 5), ("development", 35), ("conclusion", 65))]
@@ -198,6 +209,31 @@ class TestExplainer(unittest.TestCase):
             self.service._watch(self.source, [(5, 10)], 5, "Review this scene.", Discovery)
         contents = self.director._generate_content_with_retry.call_args.args[2]
         self.assertEqual(contents[0].video_metadata.fps, 5)
+
+    def test_truncated_provider_json_retries_the_same_model_with_original_contents(self):
+        self.director._unique_models.return_value = ["working-model"]
+        generate = self.director._generate_content_with_retry
+        generate.side_effect = [SimpleNamespace(text='{"observations":'), SimpleNamespace(text='{"observations":[]}')]
+        self.assertEqual(self.service._request(["Inspect the footage"], Discovery).observations, [])
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args.args[1], "working-model")
+        self.assertEqual(generate.call_args.args[2][0], "Inspect the footage")
+
+    def test_model_not_found_is_skipped_for_later_requests_in_the_same_scan(self):
+        class NotFound(RuntimeError):
+            code = 404
+
+        self.director._unique_models.return_value = ["missing-model", "working-model"]
+        generate = self.director._generate_content_with_retry
+        generate.side_effect = [
+            NotFound("Publisher model projects/test/locations/global/models/missing-model was not found."),
+            MagicMock(text=Discovery().model_dump_json()),
+            MagicMock(text=Discovery().model_dump_json()),
+        ]
+
+        self.service._request(["Scout"], Discovery)
+        self.service._request(["Verify"], Discovery)
+        self.assertEqual([call.args[1] for call in generate.call_args_list], ["missing-model", "working-model", "working-model"])
 
     def test_continuous_take_bridges_cut_and_compresses_long_pause(self):
         import numpy as np

@@ -12,12 +12,15 @@ const primary = 'rounded-lg bg-indigo-500 px-4 py-2 text-sm font-bold text-white
 const field = 'rounded-lg border border-slate-700 bg-[#0d1119] px-3 py-2 text-sm text-slate-100 min-w-0';
 const clock = (n: number) => Math.floor(n / 60) + ':' + String(Math.floor(n % 60)).padStart(2,'0');
 
-export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
+export default function FootageLibrary({ view, onCompare, onJob, onStoryJob, onClose }: {
   view: LibraryView; onCompare: (setup: LibrarySetup) => void; onJob: (job: any) => void; onClose?: () => void;
+  onStoryJob?: (jobId: string) => void;
 }) {
   const [index,setIndex] = useState<Index>({sources:[],moments:[]});
   const [source,setSource] = useState(() => {
     if (onClose) return view.source || '';
+    const linked = new URLSearchParams(window.location.search).get('source');
+    if (linked) return linked;
     try { return sessionStorage.getItem('master-selected-source') || ''; } catch { return ''; }
   });
   useEffect(() => {
@@ -38,6 +41,7 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
   const [position,setPosition] = useState(view.project?.labels.length ?? 0);
   const [busy,setBusy] = useState('');
   const [error,setError] = useState('');
+  const [pollError,setPollError] = useState('');
   const refresh = () => api<Index>('').then(setIndex);
   useEffect(() => {
     let mounted = true;
@@ -47,9 +51,10 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
         const data = await api<Index>('');
         if (mounted) {
           setIndex(data);
+          setPollError('');
           if (!onClose) setSource(current => data.sources.some(s=>s.id===current) ? current : '');
         }
-      } catch (e) { if (mounted) setError((e as Error).message); }
+      } catch (e) { if (mounted) setPollError((e as Error).message); }
       if (mounted) timer = window.setTimeout(poll, 2200);
     }
     void poll();
@@ -68,14 +73,19 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
   const lineup = ids.map(id => index.moments.find(m => m.id === id)).filter((m):m is Moment => !!m && !m.dismissed);
   const fromSource = index.moments.filter(m => (!source || m.source===source) && !!m.dismissed===showDismissed);
   const selectedSource = index.sources.find(s=>s.id===source);
-  const showSuggestions = !onClose && !!selectedSource && !showDismissed && !role && !query.trim() && !unused;
+  const showSuggestions = !onClose && !!selectedSource?.scan_complete && !selectedSource.needs_cut_review
+    && !showDismissed && !role && !query.trim() && !unused;
   const choices = (selectedSource?.clip_choices || []).flatMap(choice => {
     const cut = fromSource.find(m => m.id===choice.id && m.role===choice.role && !m.dismissed);
     return cut ? [{cut, why:choice.why}] : [];
   });
-  const lead = showSuggestions && selectedSource.cursor===selectedSource.windows ? choices[0] : undefined;
+  const lead = showSuggestions ? choices[0] : undefined;
   const filtered = fromSource.filter(m=>m.id!==lead?.cut.id).filter(m => (!role || m.role===role) && (!unused || !m.uses.length) &&
     [m.title,m.reason,...m.tags,index.sources.find(s=>s.id===m.source)?.title].join(' ').toLowerCase().includes(query.toLowerCase()));
+  if (showSuggestions) {
+    const order = new Map(choices.map(({cut}, i) => [cut.id, i]));
+    filtered.sort((a,b) => (order.get(a.id) ?? Infinity) - (order.get(b.id) ?? Infinity));
+  }
   if (view.project) {
     const project = view.project;
     const keywords = new Set((project.title + ' ' + (project.labels[Math.max(0,position-1)] || ''))
@@ -84,7 +94,8 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
       .split(/[^a-z0-9]+/).reduce((score,word)=>score+Number(keywords.has(word)),0);
     filtered.sort((a,b)=>relevance(b)-relevance(a));
   }
-  const visibleSources = index.sources.filter(s => source ? s.id===source : s.active || s.error || s.needs_cut_review || s.cursor < (s.windows ?? 1));
+  const visibleSources = index.sources.filter(s => source ? s.id===source :
+    (!onClose && index.sources.length===1) || s.active || s.error || !s.preview_url || s.needs_cut_review || !s.scan_complete);
   function toggle(m: Moment) {
     const group = m.role === 'highlight' ? 'highlight' : 'commentary';
     if (ids.includes(m.id)) { setIds(ids.filter(id=>id!==m.id)); return; }
@@ -139,27 +150,40 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
     </div>
     {visibleSources.map(s=><div key={s.id} className="space-y-2 border-l-2 border-indigo-500 pl-4 text-sm text-slate-300">
       <strong className="text-white">{s.title}</strong>
-      <div>{s.duration ? clock(s.coverage)+' / '+clock(s.duration)+' scanned' : 'Preparing source'} {s.needs_cut_review?' · Footage review pending':s.cursor===s.windows?' · Complete':s.active?' · Scanning': ' · Paused'}</div>
-      {s.duration && <progress aria-label="Scan coverage" className="block w-full h-1 accent-indigo-400" value={s.coverage} max={s.duration}/>}
+      <div role="status">
+        {s.active ? s.status_message || (s.duration ? 'Scanning footage…' : 'Preparing source…')
+          : s.needs_cut_review ? 'Footage review pending' : !s.scan_complete ? 'Scan paused'
+          : !s.preview_url ? 'Preview unavailable' : s.error ? 'Scan needs attention' : 'Scan complete'}
+        {!!s.duration && <span className="text-slate-400"> · {clock(s.coverage)} / {clock(s.duration)} scanned</span>}
+      </div>
+      {(s.active || !!s.duration) && <progress aria-label={s.duration ? 'Scan coverage' : 'Preparing source'}
+        className="block w-full h-1 accent-indigo-400" value={s.duration ? s.coverage : undefined} max={s.duration || 1}/>}
+      {!overlay && !s.scan_complete && <p className="text-slate-400">Clip picks appear after the scanner compares the whole video.</p>}
       {s.error && <p className="text-rose-300">{s.error}</p>}
-      {!s.active && (s.cursor!==s.windows || s.needs_cut_review) && <button className={button} disabled={!!busy} onClick={()=>void scan('https://youtu.be/'+s.id)}>{s.needs_cut_review?'Review footage':'Resume scan'}</button>}
+      {!s.active && (!s.scan_complete || s.needs_cut_review || !s.preview_url) && <button className={button} disabled={!!busy} onClick={()=>void scan('https://youtu.be/'+s.id)}>
+        {s.needs_cut_review ? 'Review footage' : s.scan_complete ? 'Retry preview' : 'Resume scan'}
+      </button>}
+      {onStoryJob && s.scan_complete && <button className={primary} disabled={!!busy} onClick={()=>void run('Starting full-story analysis…', async()=>{
+        const job = await api<{job_id: string}>('/sources/'+s.id+'/story','POST');
+        onStoryJob(job.job_id);
+      })}>Explain the main story</button>}
     </div>)}
-    {showSuggestions && selectedSource && selectedSource.cursor===selectedSource.windows && !selectedSource.needs_cut_review && <>
-      {lead ? <article aria-label="Main clip recommendation" className="rounded-2xl border border-indigo-400/50 bg-[#191e30] p-5 space-y-3">
+    {showSuggestions && selectedSource && <>
+      {lead ? <article aria-label="Standalone clip recommendation" className="rounded-2xl border border-indigo-400/50 bg-[#191e30] p-5 space-y-3">
         <div className="flex flex-wrap justify-between gap-2 text-sm">
-          <h3 className="font-semibold text-indigo-200">Recommended main clip · {lead.cut.role==='highlight'?'Highlight':names[lead.cut.role]}</h3>
+          <h3 className="font-semibold text-indigo-200">Recommended standalone clip · {lead.cut.role==='highlight'?'Highlight':names[lead.cut.role]}</h3>
           <span className="font-mono text-slate-300">{clock(lead.cut.start)}–{clock(lead.cut.end)}</span>
         </div>
         <h4 className="text-xl font-bold text-white">{lead.cut.title}</h4>
         <p className="text-sm text-slate-300">{lead.why}</p>
         <div className="flex flex-wrap gap-2">
-          <button className={primary} disabled={!!busy} onClick={()=>useMain(lead.cut)}>
-            {lead.cut.role==='commentary'?'Start commentary':lead.cut.role==='comparison'?'Open in Comparison':'Start a highlight ranking'}</button>
-          <button className={button} onClick={()=>setPreview(preview===lead.cut.id?'':lead.cut.id)}>{preview===lead.cut.id?'Close preview':'Preview clip'}</button>
+          <button className={primary} disabled={!!busy || (lead.cut.role==='comparison' && !selectedSource.preview_url)} onClick={()=>useMain(lead.cut)}>
+            {lead.cut.role==='commentary'?'Prepare clip commentary':lead.cut.role==='comparison'?'Open in Comparison':'Start a highlight ranking'}</button>
+          <button className={button} disabled={!selectedSource.preview_url} onClick={()=>setPreview(preview===lead.cut.id?'':lead.cut.id)}>{preview===lead.cut.id?'Close preview':'Preview clip'}</button>
         </div>
         {preview===lead.cut.id && selectedSource.asset && selectedSource.preview_url && selectedSource.duration && selectedSource.windows &&
           <Clip label={lead.cut.title} media={{asset:selectedSource.asset,preview_url:selectedSource.preview_url,duration:selectedSource.duration,windows:selectedSource.windows}} cut={lead.cut}/>}
-      </article> : selectedSource.active ? <p role="status" className="text-sm text-indigo-200">Choosing the best tab for the main clip…</p>
+      </article> : selectedSource.active ? null
         : selectedSource.clip_choices ? <p className="text-sm text-slate-300">No clip stood out to lead a video.</p>
         : <button className={button} disabled={!!busy} onClick={()=>void scan('https://youtu.be/'+selectedSource.id)}>
           {selectedSource.error?'Retry clip recommendation':'Recommend a main clip'}</button>}
@@ -184,18 +208,19 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
         <button className={button} aria-label={'Remove '+m.title} disabled={!!busy} onClick={()=>toggle(m)}>×</button></div>)}
       <button className={primary} disabled={!!busy || (kind==='highlight'?lineup.length<2:!lineup.some(m=>m.role==='commentary'))}
         onClick={()=>void run('Verifying selected footage…',async()=>{onJob(await api('/projects','POST',{ids,kind,title}));})}>
-        {kind==='highlight'?'Prepare ranked Short':'Prepare commentary'}</button>
+        {kind==='highlight'?'Prepare ranked Short':'Prepare commentary from selected clips'}</button>
       <button className={button+' ml-2'} disabled={!!busy} onClick={()=>{setIds([]);setTitle('');}}>Clear lineup</button>
     </div>}
     {busy && <p role="status" className="text-sm text-indigo-200">{busy}</p>}
-    {error && <p role="alert" className="text-sm text-rose-300">{error}</p>}
+    {(error || pollError) && <p role="alert" className="text-sm text-rose-300">{error || pollError}</p>}
     {lead && filtered.length>0 && <h3 className="font-semibold text-white">Also saved from this link</h3>}
     {!lead && !filtered.length && <div className="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">
       <Archive className="mx-auto mb-2" size={22}/>{index.sources.length?'No matching moments yet.':'Your saved moments will appear here after a scan.'}</div>}
     <div className="grid gap-4 lg:grid-cols-2">{filtered.map(m=>{
       const src=index.sources.find(s=>s.id===m.source);
-      if (!src?.duration || !src.asset || !src.preview_url || !src.windows) return null;
-      const media={duration:src.duration,asset:src.asset,preview_url:src.preview_url,windows:src.windows};
+      if (!src) return null;
+      const media=src.duration && src.asset && src.preview_url && src.windows
+        ? {duration:src.duration,asset:src.asset,preview_url:src.preview_url,windows:src.windows} : null;
       return <article key={m.id} className="rounded-xl border border-[#2b3241] bg-[#151a24] p-4 space-y-3">
         <div className="flex justify-between items-center text-xs"><span className="text-indigo-300">{names[m.role]}</span><span className="font-mono text-slate-400">{clock(m.start)}–{clock(m.end)}</span></div>
         <h3 className="text-base font-bold text-white">{m.title}</h3><p className="text-sm text-slate-300">{m.reason}</p>
@@ -203,13 +228,13 @@ export default function FootageLibrary({ view, onCompare, onJob, onClose }: {
           Also recommended · {choices.find(c=>c.cut.id===m.id)?.why}</p>}
         <p className="text-xs text-slate-400">{src.title}{m.tags.length>0?' · '+m.tags.join(' · '):''}</p>
         <div className="text-xs text-slate-400">{m.uses.length ? <>Used in {m.uses.map((u,i)=><a key={u.url} href={u.url} target="_blank" rel="noreferrer" className="text-indigo-300 underline">{(i?', ':'')+u.title}</a>)}</> : 'Unused'}</div>
-        {preview===m.id && <Clip label={m.title} media={media} cut={{start:m.start,end:m.end}}/>}
+        {preview===m.id && media && <Clip label={m.title} media={media} cut={{start:m.start,end:m.end}}/>}
         <div className="flex flex-wrap gap-2">
-          <button className={button} onClick={()=>setPreview(preview===m.id?'':m.id)}><Play size={12} className="inline mr-1"/>{preview===m.id?'Close preview':'Preview'}</button>
+          <button className={button} disabled={!media} onClick={()=>setPreview(preview===m.id?'':m.id)}><Play size={12} className="inline mr-1"/>{preview===m.id?'Close preview':'Preview'}</button>
           {m.dismissed ? <button className={button} disabled={!!busy} onClick={()=>void change(m,{dismissed:false})}>Restore</button> :
             view.project ? <button className={button} disabled={!!busy} onClick={()=>void run('Verifying supporting shot…',async()=>{
               onJob(await api('/projects/'+view.project!.job+'/'+view.project!.clip+'/support','POST',{moment_id:m.id,after:position}));})}>Insert in commentary</button> :
-            m.role==='comparison' ? <button className={button} disabled={!!busy} onClick={()=>openComparison(m)}>Open in Comparison</button> :
+            m.role==='comparison' ? <button className={button} disabled={!!busy || !media} onClick={()=>openComparison(m)}>Open in Comparison</button> :
             <button className={button} disabled={!!busy} onClick={()=>toggle(m)}>{ids.includes(m.id)?<><Check size={12} className="inline"/> Selected</>:
               m.role==='highlight'?'Add to ranking':'Add to commentary'}</button>}
           {!overlay && !m.dismissed && <button className={button} onClick={()=>setEdit(edit===m.id?'':m.id)}>Organize</button>}

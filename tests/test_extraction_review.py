@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import Mock, patch
 
 from backend.services import (
@@ -38,6 +39,7 @@ class ExtractionReviewTests(unittest.TestCase):
         return review.Decision(
             index=index,
             fits=accepted,
+            viewer_value="demonstration",
             first_event=first,
             last_event=last,
             evidence="The landing and sinking are visible.",
@@ -67,6 +69,30 @@ class ExtractionReviewTests(unittest.TestCase):
         self.service._request.reset_mock()
         self.assertEqual(review.review_cuts(self.service, Path("raw"), [self.cut]), [None])
         self.service._request.assert_not_called()
+
+    def test_factually_correct_cut_can_have_no_standalone_value(self):
+        for value in ("none", "illustration"):
+            decision = self.decision(0).model_copy(update={"viewer_value": value})
+            self.service._request.return_value = review.Decisions(cuts=[decision])
+            self.assertEqual(review.review_cuts(self.service, Path("raw"), [self.cut]), [None])
+
+    def test_parallel_views_keep_deduplication_and_alignment(self):
+        viewing = Barrier(2, timeout=5)
+        second = self.cut.model_copy(update={"start": 200, "end": 214})
+
+        def watch(*args):
+            viewing.wait()
+            return self.timeline
+
+        self.service._watch.side_effect = watch
+        self.service._request.return_value = review.Decisions(
+            cuts=[self.decision(2), self.decision(1), self.decision(0, False)]
+        )
+        cuts = review.review_cuts(self.service, Path("raw.mp4"), [self.cut, second, self.cut], parallel_views=2)
+
+        self.assertEqual(self.service._watch.call_count, 2)
+        self.assertIsNone(cuts[0])
+        self.assertEqual([cuts[1].start, cuts[2].start], [202, 152])
 
     def test_window_offsets_are_applied_once_and_only_stories_can_use_carry(self):
         def finding(role, prior):

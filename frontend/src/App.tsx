@@ -782,6 +782,17 @@ export default function App() {
   function openLibraryJob(job: any) {
     setPicker(null); selectSavedJob(job); refreshAllJobs(); setActiveTab('studio');
   }
+  function followLibraryStory(jobId: string) {
+    setActiveJobId(jobId);
+    setIsLaunching(true);
+    setPipelineError(null);
+    setProgressPct(0);
+    setProgressMsg('Reading the full video for the main story…');
+    setPipelineStep('analyzing');
+    setActivityLogs([]);
+    setActiveTab('new_project');
+    connectJobWebSocket(jobId);
+  }
   function openSetup(setup: LibrarySetup) {
     setPicker(null); setSavedSetup(setup); setActiveTab('comparison');
   }
@@ -1289,7 +1300,7 @@ export default function App() {
 
         {/* Dynamic View Body */}
         <div className="flex-1 overflow-y-auto p-8">
-          {activeTab==='master' && <FootageLibrary view={{}} onCompare={openSetup} onJob={openLibraryJob}/>}
+          {activeTab==='master' && <FootageLibrary view={{}} onCompare={openSetup} onJob={openLibraryJob} onStoryJob={followLibraryStory}/>}
           {picker && <div role="dialog" aria-label="Saved footage" className="fixed inset-0 z-50 overflow-auto bg-black/75 p-4 md:p-8">
             <div className="mx-auto max-w-5xl rounded-2xl bg-[#10141d] p-5 md:p-8">
               <FootageLibrary view={picker} onCompare={openSetup} onJob={openLibraryJob} onClose={()=>setPicker(null)}/>
