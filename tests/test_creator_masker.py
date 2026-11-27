@@ -44,19 +44,28 @@ class TestCreatorMasker(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 CreatorOverlayRegion(kind='facecam', **rect)
 
-    def _audit(self, payload, localized=None):
+    def _audit(self, payload, localized=None, *, missing_primary=False):
         director = MagicMock()
         director.temp_dir = self.root
+        director._unique_models.return_value = ["primary", "fallback"]
         director._prepare_video_part.return_value = (types.Part.from_bytes(data=b'video', mime_type='video/mp4'), None, None)
         if localized is None:
             localized = {'regions': [
                 {'kind': r['kind'], 'visible_text': r.get('label', ''),
                  'box_2d': [round(r['y']*1000), round(r['x']*1000), round((r['y']+r['height'])*1000), round((r['x']+r['width'])*1000)]}
                 for r in payload.get('regions', [])]}
-        director._generate_content_with_retry.side_effect = [SimpleNamespace(text=json.dumps(payload)), SimpleNamespace(text=json.dumps(localized))]
+        responses = [SimpleNamespace(text=json.dumps(payload)), SimpleNamespace(text=json.dumps(localized))]
+        if missing_primary:
+            class MissingModel(RuntimeError):
+                code = 404
+            responses.insert(0, MissingModel("Publisher model models/primary was not found"))
+        director._generate_content_with_retry.side_effect = responses
         with patch('backend.services.creator_masker.subprocess.run', return_value=SimpleNamespace(stdout=b'jpeg')):
             result = audit_creator_overlays(director, self.source, [(5, 3), (100, 4)])
-        contents = director._generate_content_with_retry.call_args_list[0].args[2]
+        calls = director._generate_content_with_retry.call_args_list
+        if missing_primary:
+            self.assertEqual([call.args[1] for call in calls], ["primary", "fallback", "fallback"])
+        contents = calls[0].args[2]
         self.assertEqual([part.video_metadata.fps for part in contents[:2]], [5, 5])
         self.assertEqual([part.inline_data.mime_type for part in contents[2:-1]], ['image/jpeg', 'image/jpeg'])
         self.assertFalse(director._prepare_video_part.call_args.kwargs['allow_compress'])
@@ -66,6 +75,11 @@ class TestCreatorMasker(unittest.TestCase):
         result = self._audit({'detected': True, 'label': None, 'corner': 'top_right',
                               'regions': [r.model_dump() for r in self.regions]})
         self.assertEqual(len(result.regions), 2)
+
+    def test_unavailable_model_uses_fallback_for_detection_and_localization(self):
+        result = self._audit({'detected': True, 'regions': [r.model_dump() for r in self.regions]},
+                             missing_primary=True)
+        self.assertEqual([region.kind for region in result.regions], ['facecam', 'channel_logo'])
 
     def test_incomplete_audit_stops_instead_of_claiming_clean(self):
         with self.assertRaisesRegex(ValueError, 'Incomplete'):

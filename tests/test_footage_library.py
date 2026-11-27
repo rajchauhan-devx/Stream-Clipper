@@ -15,7 +15,7 @@ from backend.services.explainer import provider_schema
 
 class FootageLibraryTests(unittest.TestCase):
     def setUp(self):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(patch.object(config, "WORKSPACE_DIR", root))
         self.enterContext(patch.object(config, "DOWNLOADS_DIR", root))
         for source in ("aaaaaaaaaaa", "bbbbbbbbbbb"):
@@ -76,9 +76,9 @@ class FootageLibraryTests(unittest.TestCase):
         def watch(*args):
             status = source_status()
             self.assertIsNone(status["preview_url"])
-            self.assertEqual(status["status_message"], "Scanning section 1 of 1…")
+            self.assertIn("Transcribing dialogue", status["status_message"])
             scan_started.set()
-            return library.Scan(findings=[], ongoing_story="")
+            return library.story_scan.Section(speech=[], visuals=[])
 
         with (
             patch.object(library, "Thread"),
@@ -103,7 +103,7 @@ class FootageLibraryTests(unittest.TestCase):
             with library.resetting_catalogue():
                 pass
             library.start_scan(request)
-            return library.Scan(findings=[], ongoing_story="")
+            return library.story_scan.Section(speech=[], visuals=[])
 
         with patch.dict(library.active, clear=True), patch.object(library, "Thread"), patch.object(
             library.ExplainerService, "_watch", side_effect=watch
@@ -122,13 +122,13 @@ class FootageLibraryTests(unittest.TestCase):
         with patch.object(config, "PROXIES_DIR", config.DOWNLOADS_DIR):
             preview = library.board.browser_preview_path(original)
             preview.touch()
-            result = library.Scan(findings=[library.ScoutedFinding(role="highlight", title="Splash",
-                reason="The landing throws a wave over the dock.", tags=[], record="", start=12, end=21)],
-                ongoing_story="")
+            result = library.story_scan.Section(speech=[], visuals=[
+                library.story_scan.Observation(start=12,end=21,evidence="The landing throws a wave.")])
+            slate = library.story_scan.Pitches(proposals=[], other_finds=[library.Finding(role="highlight",
+                title="Splash", reason="Visible wave", tags=[], record="", start=12, end=21)])
             with patch.object(library.ExplainerService, "_watch", return_value=result) as watch, patch.object(
                 library, "review_cuts", return_value=[]
-            ) as verify, patch.object(library.ExplainerService, "_request", return_value=library.ClipChoices(
-                ranked=[library.ClipChoice(candidate=0, why="Visible splash")])):
+            ) as verify, patch.object(library.ExplainerService, "_request", return_value=slate):
                 library.scan_source(self.first, library.ScanRun())
 
         self.assertEqual([call.args[0] for call in watch.call_args_list], [preview, preview])
@@ -169,8 +169,8 @@ class FootageLibraryTests(unittest.TestCase):
             self.first, Mock(_request=Mock(return_value=library.ClipChoices(ranked=[])))
         )
         with library.db() as conn:
-            conn.execute("UPDATE sources SET media=json_set(media,'$.selection_version',?) WHERE id=?",
-                         (library.SELECTION_VERSION, self.first))
+            conn.execute("UPDATE sources SET media=json_set(media,'$.selection_version',?,'$.story_scan_version',2,'$.best_short',json(?)) WHERE id=?",
+                         (library.SELECTION_VERSION, json.dumps({"status":"empty", "why":"No story evidence"}), self.first))
         with patch.object(library, "Thread") as thread:
             request = library.board.SourceRequest(url=f"https://www.youtube.com/watch?v={self.first}&t=4")
             self.assertEqual(library.start_scan(request), {"id": self.first})
@@ -204,8 +204,96 @@ class FootageLibraryTests(unittest.TestCase):
             self.assertEqual(kept["title"], "Dog drives the truck")
             library.active.pop(self.first)
             library.start_scan(request)
-            self.assertEqual(thread.call_count, 1)
+            self.assertEqual(thread.call_count, 2)  # Upgrade this legacy scan with a full transcript.
+            self.assertEqual(next(s for s in library.catalogue()["sources"] if s["id"] == self.first)["cursor"], 2)
             self.assertEqual(library.selected([old["Generic introduction"]])[0]["title"], "Generic introduction")
+
+    def test_main_is_one_verified_source_clip_and_other_tabs_remain_available(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(main.app)
+        self.save(self.first, 0, [("highlight", "Jump", 5, 15), ("commentary", "Escape", 30, 90)])
+        self.save(self.first, 1, [])
+        moments = {m["role"]: m for m in library.catalogue()["moments"]}
+        highlight, story = [{"id": moments[r]["id"], "role": r, "why": "Visible outcome"}
+                            for r in ("highlight", "commentary")]
+        for choices, expected in (([highlight, story], story), ([highlight], highlight), ([], None)):
+            with library.db() as conn:
+                conn.execute("UPDATE sources SET media=json_set(media,'$.clip_choices',json(?),"
+                             "'$.selection_version',?,'$.story_scan_version',2,'$.best_short',json(?)) WHERE id=?",
+                             (json.dumps(choices), library.SELECTION_VERSION,
+                              json.dumps({"status":"ready","url":"obsolete.mp4"}), self.first))
+            with patch.object(library, "Thread") as worker:
+                client.post("/api/library/scan", json={"url": "https://youtu.be/" + self.first}).raise_for_status()
+                worker.assert_not_called()
+            result = client.get("/api/library").json()
+            src = next(s for s in result["sources"] if s["id"] == self.first)
+            self.assertEqual(src["main_clip"], expected)
+            self.assertNotIn("best_short", src)
+            self.assertEqual(len(result["moments"]), 2)
+
+    def test_secondary_finds_survive_when_their_role_has_no_main_candidate(self):
+        self.save(self.first, 0, [("commentary", "Context", 5, 40), ("highlight", "Jump", 42, 55),
+                                  ("support", "Footprint", 56, 62)])
+        self.save(self.first, 1, [])
+        rows = library.catalogue()["moments"]
+        by_role = {r["role"]: r for r in rows}
+        with library.db() as conn:
+            conn.execute("UPDATE sources SET media=json_set(media,'$.candidate_ids',json(?),"
+                         "'$.shortlisted_by_role',json('true')) WHERE id=?",
+                         (json.dumps([r["id"] for r in rows]), self.first))
+        def rank(service, candidates):
+            return [{"id": r["id"]} for r in candidates if r["role"] == "highlight"]
+        def watch(service, source, picks, candidates):
+            return [dict(p, title=by_role[p["role"]]["title"]) for p in picks]
+        with patch.object(library, "shortlist", side_effect=rank), patch.object(library, "check_playback", side_effect=watch):
+            library.review_saved_clips(self.first, Mock())
+        index = library.catalogue()
+        source = next(s for s in index["sources"] if s["id"] == self.first)
+        self.assertEqual(source["main_clip"]["id"], by_role["highlight"]["id"])
+        self.assertEqual({r["role"] for r in index["moments"]}, {"commentary", "highlight", "support"})
+
+    def test_story_review_adds_verified_passage_and_keeps_existing_highlight(self):
+        self.save(self.first, 0, [("highlight", "Jump", 5, 15)])
+        self.save(self.first, 1, [])
+        moment, = library.catalogue()["moments"]
+        choices = [{"id": moment["id"], "role": "highlight", "why": "Visible jump"}]
+        sections = {"0":{"speech":[{"start":10,"end":15,"text":"Make it back.","speaker":"game"}],"visuals":[]},
+                    "1":{"speech":[], "visuals":[{"start":280,"end":285,"evidence":"He returns."}]}}
+        with library.db() as conn:
+            conn.execute("UPDATE sources SET media=json_set(media,'$.clip_choices',json(?),"
+                         "'$.timeline_sections',json(?),'$.visible_ids',json(?)) WHERE id=?",
+                         (json.dumps(choices), json.dumps(sections), json.dumps([moment["id"]]), self.first))
+        service = Mock()
+        service._request.return_value = library.story_scan.Pitches(other_finds=[], proposals=[
+            library.story_scan.StoryPitch(role="commentary", citations=[
+                library.story_scan.Citation(near=11, excerpt="Make it back"),
+                library.story_scan.Citation(near=278, excerpt="He returns")], title="A return", why="A promise kept")])
+        service._watch.return_value = library.story_scan.StoryReview(keep=True,title="A return",why="A promise kept",
+            scenes=[library.story_scan.CheckedScene(window=0,start=8,end=16,purpose="Promise",original_line="Make it back."),
+                    library.story_scan.CheckedScene(window=1,start=6,end=17,purpose="Return",original_line="")])
+        media = {"windows":2,"duration":320}
+        library.finish_story_scan(self.first,service,Path("source"),media,sections,None,lambda msg:None)
+        result = library.catalogue()
+        source = next(s for s in result["sources"] if s["id"] == self.first)
+        plan = source["main_clip"]
+        self.assertEqual(plan["role"], "commentary")
+        self.assertEqual([(s["start"],s["end"]) for s in plan["scenes"]],[(9,17),(277,288)])
+        self.assertIn(choices[0], source["clip_choices"])
+        self.assertEqual(len(result["moments"]), 3)
+        self.assertTrue(library.source_transcript(self.first)["complete"])
+        lineup=library.Lineup(ids=[s["id"] for s in plan["scenes"]],kind="commentary",story_source=self.first)
+        script = library.ScriptedScene(**self.verified().model_dump(exclude={"scenes"}), label="Return",
+                                      narration="He keeps his promise.", evidence="He arrives home.")
+        progress = Mock()
+        with patch.object(library.ExplainerService, "_watch", return_value=script) as watching:
+            job = library.make_job(lineup, progress)
+        self.assertEqual([(b["start_time"], b["duration"]) for b in job["clips"][0]["beats"]], [(9, 8), (277, 11)])
+        self.assertEqual([call.args[:2] for call in progress.call_args_list], [(0, 2), (1, 2)])
+        self.assertTrue(all(call.args[-1] is library.ScriptedScene for call in watching.call_args_list))
+        self.assertEqual(job["clips"][0]["hook_text"], "A return")
+        self.assertEqual(job["clips"][0]["source_story"]["scenes"][0]["original_line"], "Make it back.")
+        self.assertIn("A promise kept",watching.call_args.args[3])
+        self.assertEqual([b["library_id"] for b in job["clips"][0]["beats"]],lineup.ids)
 
     def test_final_playback_rejects_payoff_outside_saved_cut(self):
         candidate = dict(id="a", start=1105, end=1115, role="highlight")
@@ -312,7 +400,7 @@ class FootageLibraryTests(unittest.TestCase):
         self.assertEqual(next(s for s in index["sources"] if s["id"] == self.first)["clip_choices"], [])
         self.assertEqual(index["moments"][0]["role"], "support")
 
-    def test_completed_legacy_scan_reviews_saved_observations_without_rescanning(self):
+    def test_completed_scan_reuses_transcript_when_refreshing_saved_observations(self):
         self.save(self.first, 0, [("comparison", "How does it land?", 10, 20)])
         self.save(self.first, 1, [])
         choice = library.ClipChoices(
@@ -320,8 +408,9 @@ class FootageLibraryTests(unittest.TestCase):
         )
         with library.db() as conn:
             conn.execute(
-                "UPDATE sources SET media=json_remove(media,'$.extraction_review') WHERE id=?",
-                (self.first,),
+                "UPDATE sources SET media=json_set(json_remove(media,'$.extraction_review'),'$.story_scan_version',2,"
+                "'$.timeline_sections',json(?)) WHERE id=?",
+                (json.dumps({"0":{},"1":{}}),self.first),
             )
         with (
             patch.object(library.ExplainerService, "_request", return_value=choice),
@@ -369,7 +458,10 @@ class FootageLibraryTests(unittest.TestCase):
         self.assertEqual(library.selected(ids)[0]["title"], "A")
         with patch.object(library.ExplainerService, "_watch", return_value=self.verified()):
             job = library.make_job(library.Lineup(kind="highlight", ids=ids, title="Two landings"))
-            story = library.make_job(library.Lineup(kind="commentary", ids=[moments["Story"]["id"]]))
+            story = library.make_job(library.Lineup(kind="commentary", ids=[moments["Story"]["id"]],
+                                                     tts_voice="Puck", enable_watermark_masker=False))
+            self.assertEqual(story["clips"][0]["tts_voice"], "Puck")
+            self.assertFalse(story["request"]["enable_watermark_masker"])
             draft = library.with_support(
                 story, story["clips"][0], library.Insert(moment_id=moments["Detail"]["id"], after=0)
             )
@@ -444,3 +536,48 @@ class FootageLibraryTests(unittest.TestCase):
         source = next(s for s in cat["sources"] if s["id"] == self.first)
         self.assertEqual(source["clip_choices"][0]["id"], rows["Splash"]["id"])
         self.assertTrue(next(m for m in cat["moments"] if m["title"] == "Invented crash")["dismissed"])
+
+
+class LineupProgressTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(main, "JOBS_DB", {}))
+        self.enterContext(patch.object(main, "ACTIVE_TASKS", {}))
+        self.enterContext(patch.object(main, "save_jobs_db"))
+        self.lineup = library.Lineup(kind="commentary", ids=["first", "second"], title="Story")
+
+    async def test_running_lineup_reports_scene_and_finishes_once(self):
+        ready, release = Event(), Event()
+
+        def prepare(lineup, report):
+            report(1, 2, "Preparing scene 2 of 2")
+            ready.set()
+            if not release.wait(5):
+                raise RuntimeError("Test did not release the worker")
+            return dict(request={}, metadata={"title": "Story"}, clips=[{"clip_id": "clip_1"}], step="Ready")
+
+        with patch.object(library, "make_job", side_effect=prepare) as make:
+            queued = await main.build_saved_project(self.lineup, background=True)
+            key = queued["job_id"]
+            worker = main.ACTIVE_TASKS[key]
+            try:
+                self.assertTrue(await asyncio.to_thread(ready.wait, 5))
+                activity = next(item for item in await main.background_activity() if item["id"] == key)
+                self.assertEqual((activity["percent"], activity["step"]), (50, "Preparing scene 2 of 2"))
+                duplicate = await main.build_saved_project(self.lineup, background=True)
+                self.assertEqual(duplicate["job_id"], key)
+            finally:
+                release.set()
+                await worker
+        make.assert_called_once()
+        job = await main.get_job(key)
+        self.assertEqual((job["status"], job["progress_pct"], job["clips"][0]["clip_id"]), ("completed", 100, "clip_1"))
+        self.assertNotIn(key, [item["id"] for item in await main.background_activity()])
+
+    async def test_failed_lineup_exposes_editor_error(self):
+        with patch.object(library, "make_job", side_effect=HTTPException(422, "Scene 2 has no matching dialogue")):
+            queued = await main.build_saved_project(self.lineup, background=True)
+            key = queued["job_id"]
+            await main.ACTIVE_TASKS[key]
+        job = await main.get_job(key)
+        self.assertEqual((job["status"], job["error"]), ("failed", "Scene 2 has no matching dialogue"))
+        self.assertNotIn(key, main.ACTIVE_TASKS)

@@ -146,12 +146,12 @@ class ExplainerService:
         self.director = director
         self._unavailable_models: set[tuple[object, str]] = set()
 
-    def _request(self, contents: list[Any], schema: type[Result]) -> Result:
+    def _request(self, contents: list[Any], schema: type[Result], *, temperature: float = 0.2) -> Result:
         client = self.director._ensure_client()
         if not client:
             raise RuntimeError("Explainer requires a configured Gemini connection; demo stories are not used.")
         config = types.GenerateContentConfig(
-            response_mime_type="application/json", response_schema=provider_schema(schema.model_json_schema()), temperature=0.2,
+            response_mime_type="application/json", response_schema=provider_schema(schema.model_json_schema()), temperature=temperature,
             max_output_tokens=12288,
         )
         last_error: Exception | None = None
@@ -176,7 +176,7 @@ class ExplainerService:
                     self._unavailable_models.add(model_key)
                 logger.warning("Explainer %s failed on %s: %s", schema.__name__, model, exc)
                 last_error = exc
-        raise RuntimeError("Explainer analysis could not be completed; no unverified clips were selected.") from last_error
+        raise RuntimeError(f"Vision analysis for {schema.__name__} could not be completed with the available models.") from last_error
 
     def _watch(
         self, source: Path, windows: list[tuple[float, float]], fps: float,

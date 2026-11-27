@@ -130,8 +130,8 @@ export default function ComparisonBoard({ visible, onRender, saved, onConsumed, 
           setBoard(b => ({ ...b, source: media, cursor: source.cursor,
             topics: [...b.topics.filter(t => b.cards[t.id]?.selected && !topics.some(m => m.id === t.id)), ...topics] }));
         }
-        if (source.cursor === source.windows && !source.needs_cut_review) break;
         if (source.error) throw new Error(source.error);
+        if (!source.active && source.scan_complete && !source.needs_cut_review && source.clip_choices) break;
         if (!source.active) throw new Error('Scan paused. Resume to continue from the last saved section.');
         setScanning(source.needs_cut_review ? 'Reviewing saved cuts against the footage…' : source.windows ? 'Examining section ' + (source.cursor + 1) + ' of ' + source.windows + '…' : 'Preparing the source video…');
         await new Promise(resolve => setTimeout(resolve, 2200));

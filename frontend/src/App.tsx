@@ -1,7 +1,8 @@
+import BackgroundActivity from './BackgroundActivity';
 import { libraryRequest } from './footageApi';
 import FootageLibrary, { type LibrarySetup, type LibraryView } from './FootageLibrary';
 import ComparisonBoard, { comparisonDraftKey } from './ComparisonBoard';
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Zap,
   FolderPlus,
@@ -266,6 +267,7 @@ export default function App() {
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       try {
         const msg = JSON.parse(event.data);
         if (msg.event === 'state_snapshot' && msg.job) {
@@ -280,6 +282,7 @@ export default function App() {
           if (snap.metadata) setJobMetadata(snap.metadata);
           if (Array.isArray(snap.clips) && snap.clips.length > 0) {
             setClips(snap.clips);
+            setIsRenderingClip(snap.clips.some((clip: {status?: string}) => clip.status === 'rendering'));
           }
         } else if (msg.event === 'progress') {
           setProgressPct(msg.progress_pct);
@@ -348,9 +351,15 @@ export default function App() {
     };
 
     ws.onerror = (err) => console.warn('WebSocket error:', err);
+    ws.onclose = () => {
+      if (wsRef.current !== ws) return;
+      window.setTimeout(() => {
+        if (wsRef.current === ws) connectJobWebSocket(jobId);
+      }, 2000);
+    };
   };
 
-  const refreshAllJobs = () => {
+  const refreshAllJobs = useCallback(() => {
     fetch('/api/jobs')
       .then((res) => (res.ok ? res.json() : []))
       .then((jobs) => {
@@ -359,7 +368,7 @@ export default function App() {
         }
       })
       .catch(() => {});
-  };
+  }, []);
 
   const refreshSavedComparisons = (selectLatest = false) => {
     fetch('/api/comparison/list')
@@ -782,7 +791,19 @@ export default function App() {
   function openLibraryJob(job: any) {
     setPicker(null); selectSavedJob(job); refreshAllJobs(); setActiveTab('studio');
   }
+  function openFormatPicker(view: LibraryView) {
+    const format = view.role==='highlight' ? 'highlight' : 'explainer';
+    if (format !== videoFormat) {
+      setVideoFormat(format);
+      setClipLength(format==='highlight' ? '60s-95s' : '30s-55s');
+      setClipCount(format==='highlight' ? 1 : 3);
+      if (format==='explainer') setVoiceoverPacing('full_commentary');
+    }
+    setActiveTab('new_project');
+    setPicker(view);
+  }
   function followLibraryStory(jobId: string) {
+    setPicker(null);
     setActiveJobId(jobId);
     setIsLaunching(true);
     setPipelineError(null);
@@ -1300,10 +1321,12 @@ export default function App() {
 
         {/* Dynamic View Body */}
         <div className="flex-1 overflow-y-auto p-8">
-          {activeTab==='master' && <FootageLibrary view={{}} onCompare={openSetup} onJob={openLibraryJob} onStoryJob={followLibraryStory}/>}
+          {!picker && <BackgroundActivity onFinished={refreshAllJobs}/>}
+          {activeTab==='master' && <FootageLibrary view={{}} onCompare={openSetup} onJob={openLibraryJob} onRoute={openFormatPicker}/>}
           {picker && <div role="dialog" aria-label="Saved footage" className="fixed inset-0 z-50 overflow-auto bg-black/75 p-4 md:p-8">
             <div className="mx-auto max-w-5xl rounded-2xl bg-[#10141d] p-5 md:p-8">
-              <FootageLibrary view={picker} onCompare={openSetup} onJob={openLibraryJob} onClose={()=>setPicker(null)}/>
+              <BackgroundActivity onFinished={refreshAllJobs}/>
+              <FootageLibrary view={picker} initialVoice={selectedVoice} initialMask={enableWatermarkMasker} onStoryJob={followLibraryStory} onCompare={openSetup} onJob={openLibraryJob} onClose={()=>setPicker(null)}/>
             </div></div>}
           {/* VIEW 1: NEW PROJECT */}
           {activeTab === 'new_project' && (

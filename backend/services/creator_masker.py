@@ -1,6 +1,5 @@
 """Audit exact render windows for every creator overlay, independently of story selection."""
 
-import json
 import subprocess
 import uuid
 from pathlib import Path
@@ -10,9 +9,8 @@ from typing import Literal
 from google.genai import types
 from pydantic import BaseModel
 
-import backend.config as app_config
 from backend.schemas import WatermarkInfo, WatermarkCorner, CreatorOverlayRegion
-from backend.services.explainer import provider_schema
+from backend.services.explainer import ExplainerService
 
 
 class LocalizedOverlay(BaseModel):
@@ -73,16 +71,8 @@ For creator_text, you must be able to point to the actual readable channel lette
 in the supplied images. If those letters are absent, omit that creator_text region entirely.
 detected=true requires nonempty regions. detected=false requires regions=[]. No inferred clean result.
 """
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=provider_schema(WatermarkInfo.model_json_schema()),
-            temperature=0, max_output_tokens=4096,
-        )
-        model = app_config.DIRECTOR_MODEL
-        if "gemini-2.5" in model:
-            config.thinking_config = types.ThinkingConfig(thinking_budget=1024)
-        response = director._generate_content_with_retry(client, model, [*parts, *stills, prompt], config)
-        result = WatermarkInfo.model_validate(json.loads(response.text))
+        vision = ExplainerService(director)
+        result = vision._request([*parts, *stills, prompt], WatermarkInfo, temperature=0)
         if result.detected != bool(result.regions):
             raise ValueError("Incomplete creator-overlay audit; refusing to render without mask geometry.")
         if not result.detected:
@@ -90,7 +80,6 @@ detected=true requires nonempty regions. detected=false requires regions=[]. No 
 
         # Spatial grounding is separate from temporal video discovery. Standard image boxes
         # avoid video-only estimates that can double camera height or invent channel text.
-        config.response_schema = provider_schema(LocalizedOverlays.model_json_schema())
         localization = """Locate ONLY real streamer webcam boxes and creator/channel logos or
 readable channel names in these full-frame images. Return tight bounding boxes in standard
 box_2d=[ymin,xmin,ymax,xmax], integers normalized 0..1000 relative to the FULL image height/width.
@@ -100,8 +89,7 @@ visible_text must be literal letters visible inside that box, otherwise empty.
 Output only regions actually visible in these images. If an overlay moves between images,
 return its union rectangle. Include every separate creator logo, not only the camera.
 """
-        response = director._generate_content_with_retry(client, model, [*stills, localization], config)
-        localized = LocalizedOverlays.model_validate(json.loads(response.text))
+        localized = vision._request([*stills, localization], LocalizedOverlays, temperature=0)
         regions = []
         for region in localized.regions:
             box = region.box_2d

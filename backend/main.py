@@ -84,6 +84,7 @@ app.mount("/workspace", StaticFiles(directory=str(WORKSPACE_DIR)), name="workspa
 # In-memory Job & WebSocket Connection State
 JOBS_DB: Dict[str, Dict[str, Any]] = {}
 ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
+MANUAL_RENDERS: dict[tuple[str, str], str] = {}
 JOBS_CACHE_FILE = WORKSPACE_DIR / "jobs_db.json"
 COMPARISONS_DB: List[Dict[str, Any]] = []
 COMPARISONS_CACHE_FILE = WORKSPACE_DIR / "comparisons_db.json"
@@ -107,6 +108,10 @@ def load_jobs_db():
             try:
                 loaded = json.loads(JOBS_CACHE_FILE.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
+                    for job in loaded.values():
+                        if job.get("library_lineup") and job.get("status") in ("pending", "analyzing"):
+                            job.update(status="failed", step="Preparation interrupted",
+                                       error="Preparation was interrupted by a server restart. Retry the saved lineup.")
                     JOBS_DB.update(loaded)
                     logger.info(f"Loaded {len(loaded)} job(s) from {JOBS_CACHE_FILE}")
             except Exception as e:
@@ -405,6 +410,8 @@ async def render_single_clip(job_id: str, clip_idx: int, total_clips: int = 1, p
             clip.get("voice_path", "")
         ).endswith("_continuous_voice.wav")
         if migrated_english or legacy_explainer_voice or not clip.get("voice_path"):
+            if progress_callback:
+                progress_callback("Generating the voiceover for the selected scenes…")
             if clip.get("video_format") == VideoFormat.EXPLAINER:
                 voice = await asyncio.to_thread(english_service.synthesize_narration, clip, job_id)
             else:
@@ -762,6 +769,19 @@ async def execute_job_pipeline(job_id: str, library_source: dict | None = None):
             pass
 
     try:
+        if "library_lineup" in job:
+            def scene_progress(done, total, message):
+                if job_id not in ACTIVE_TASKS:
+                    raise RuntimeError("Preparation cancelled.")
+                update = send_progress(round(100 * done / total), message, JobStatus.ANALYZING)
+                asyncio.run_coroutine_threadsafe(update, loop).result()
+
+            await send_progress(0, "Loading selected source footage…", JobStatus.ANALYZING)
+            draft = await asyncio.to_thread(footage_library.make_job, footage_library.Lineup(**job["library_lineup"]), scene_progress)
+            await send_progress(100, draft["step"], JobStatus.COMPLETED,
+                                {k: draft[k] for k in ("clips", "metadata", "request")})
+            return
+
         # Step 1: Ingest Raw Video
         if library_source is not None:
             meta = dict(library_source)
@@ -929,7 +949,9 @@ async def execute_job_pipeline(job_id: str, library_source: dict | None = None):
     except Exception as e:
         logger.error(f"Pipeline error for job {job_id}: {e}", exc_info=True)
         job["status"] = JobStatus.FAILED
-        job["error"] = str(e)
+        job["error"] = str(e.detail) if isinstance(e, HTTPException) else str(e)
+        job["step"] = job["error"]
+        save_jobs_db()
         await manager.broadcast(job_id, {
             "event": "error",
             "job_id": job_id,
@@ -1035,7 +1057,7 @@ async def create_job(request: CreateJobRequest):
     return queue_job(request)
 
 
-def queue_job(request: CreateJobRequest, library_source: dict | None = None):
+def queue_job(request: CreateJobRequest, library_source: dict | None = None, *, lineup=None):
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
     job_entry = {
@@ -1048,6 +1070,8 @@ def queue_job(request: CreateJobRequest, library_source: dict | None = None):
         "plan": None,
         "clips": []
     }
+    if lineup is not None:
+        job_entry.update(library_lineup=lineup.model_dump(), step="Queued for footage preparation")
     JOBS_DB[job_id] = job_entry
     save_jobs_db()
     logger.info(f"Created new job: {job_id} [Mode: {request.mode}]")
@@ -1145,6 +1169,23 @@ async def cancel_job(job_id: str):
     """Cancels a specific job and wipes its associated downloads and artifacts."""
     return await reset_pipeline(ResetPipelineRequest(job_id=job_id, delete_all=False))
 
+@app.get("/api/activity")
+async def background_activity():
+    activities = []
+    for key in ACTIVE_TASKS:
+        job = JOBS_DB.get(key, {})
+        title = (job.get("library_lineup", {}).get("title") or (job.get("metadata") or {}).get("title")
+                 or "Project preparation")
+        activities.append({"id": key, "title": title, "step": job.get("step", "Queued"),
+                           "percent": job.get("progress_pct", 0)})
+    for (job_id, clip_id), step in MANUAL_RENDERS.items():
+        activities.append({"id": f"{job_id}/{clip_id}", "title": "Rendering clip", "step": step})
+    with footage_library.lock:
+        for key, run in footage_library.active.items():
+            activities.append({"id": key, "title": "Master Scanner", "step": run.message})
+    return activities
+
+
 @app.get("/api/jobs")
 async def list_all_jobs():
     return list(JOBS_DB.values())
@@ -1233,12 +1274,20 @@ async def render_clip_endpoint(job_id: str, clip_id: str, background_tasks: Back
     if clip_idx is None:
         raise HTTPException(status_code=404, detail="Clip not found")
 
+    render_key = (job_id, clip_id)
+    if render_key in MANUAL_RENDERS:
+        return {"status": "success", "message": "This clip is already rendering."}
+    MANUAL_RENDERS[render_key] = "Starting render"
+
+    def report(message):
+        MANUAL_RENDERS[render_key] = message
+
     async def run_render():
         try:
             clips[clip_idx]["status"] = "rendering"
             save_jobs_db()
             await manager.broadcast(job_id, {"event": "clip_rendering", "clip_id": clip_id})
-            await render_single_clip(job_id, clip_idx)
+            await render_single_clip(job_id, clip_idx, progress_callback=report)
             await manager.broadcast(job_id, {
                 "event": "clip_rendered",
                 "clip_id": clip_id,
@@ -1253,6 +1302,9 @@ async def render_clip_endpoint(job_id: str, clip_id: str, background_tasks: Back
                 "clip_id": clip_id,
                 "message": str(e)
             })
+
+        finally:
+            MANUAL_RENDERS.pop(render_key, None)
 
     background_tasks.add_task(run_render)
     return {"status": "success", "message": f"Rendering clip {clip_id} initiated."}
@@ -1495,7 +1547,14 @@ def store_library_job(job):
 
 
 @app.post("/api/library/projects")
-async def build_saved_project(payload: footage_library.Lineup):
+async def build_saved_project(payload: footage_library.Lineup, background: bool = False):
+    if background:
+        for key in ACTIVE_TASKS:
+            if JOBS_DB.get(key, {}).get("library_lineup") == payload.model_dump():
+                return {"job_id": key, "status": JOBS_DB[key]["status"]}
+        request = CreateJobRequest(url_or_path="saved footage", mode="manual_studio", clip_count=1,
+                                   video_format="explainer" if payload.kind == "commentary" else "highlight")
+        return queue_job(request, lineup=payload)
     return store_library_job(await asyncio.to_thread(footage_library.make_job, payload))
 
 
